@@ -776,6 +776,122 @@ let vectorize_loops (mir : Program.Typed.t) =
         match fd with Some _ -> String.Map.empty | None -> trusted_sizes in
       top_down_map_rec_stmt_loc (vectorize_statement sizes))
 
+(* Rewrite the gathered 2PL Bernoulli-logit likelihood into the gathered-GLM
+   primitive call (W-108 increment 2).
+
+   The IRT likelihood [y ~ bernoulli_logit(alpha[ii] .* (theta[jj] -
+   beta[ii]))] lowers in the reverse-mode log prob to
+
+   [bernoulli_logit_lpmf(y, elt_multiply(rvalue(alpha, index_multi(ii)),
+   subtract(rvalue(theta, index_multi(jj)), rvalue(beta,
+   index_multi(ii)))))]
+
+   which stan-math evaluates through per-elementwise-op autodiff nodes that
+   each materialize the gathered operands (the W-34/W-48 measurements: the
+   gathered eltwise complex is ~35% of the model's gradient instruction
+   count). The paired stan-math primitive
+
+   [bernoulli_logit_lpmf_gathered(y, theta, jj, alpha, beta, ii)]
+
+   (stan-math branch [gathered-glm], W-108 increment 1) takes the index
+   vectors instead of the gathered matrices and is bit-identical to the
+   composed stock expression while removing the whole complex (-40.9%
+   Ir/grad on hier_2pl, W-108 gate (c)). It accepts the operand-mix layouts
+   the compiler actually emits ([var_value] SoA and [Matrix<var>] AoS
+   alike), so the rewrite needs no layout side conditions.
+
+   This pass recognizes exactly that pattern — in the reverse-mode log prob
+   only, so the double-mode instantiation keeps the stock expression (the
+   primitive requires var operands) — and replaces the call, preserving the
+   [propto] suffix and the original call metadata. Gates: the density must
+   be [bernoulli_logit_lpmf] whose random variable is a data integer
+   vector; the second argument must be the literal three-leaf tree
+   [elt_multiply(gather(alpha, ii), subtract(gather(theta, jj),
+   gather(beta, ii)))] over AutoDiffable vector variables multi-indexed by
+   data integer index vectors, with [alpha] and [beta] gathered through the
+   SAME index variable. Everything else is left untouched, and no emitted
+   model changes unless it contains the pattern. The C++ backend emits the
+   matching [#include <stan/math/rev/prob/bernoulli_logit_lpmf_gathered.hpp>]
+   when the rewrite fires, so the generated model compiles against the
+   paired stan-math branch. *)
+let gather_bernoulli_logit (mir : Program.Typed.t) =
+  let data_vars =
+    List.map mir.input_vars ~f:(fun (name, _, _) -> name)
+    |> String.Set.of_list in
+  (* A gathered coefficient leaf: vector_var [ MultiIndex (data int
+     vector var) ]. Returns the bare container var expression, the index
+     variable's name, and the bare index var expression. *)
+  let leaf (e : Expr.Typed.t) :
+      (Expr.Typed.t * string * Expr.Typed.t) option =
+    match e.pattern with
+    | Indexed
+        ( ( { pattern= Var _
+            ; meta= {type_= UVector; adlevel= AutoDiffable; _}
+            ; _ } as container )
+        , [ Index.MultiIndex
+              ( { pattern= Var idx
+                ; meta= {type_= UArray UInt; adlevel= DataOnly; _}
+                ; _ } as index ) ] )
+      when String.Set.mem idx data_vars ->
+        Some (container, idx, index)
+    | _ -> None in
+  (* The random variable: a data integer vector. *)
+  let rv_ok (e : Expr.Typed.t) =
+    match (e.pattern, e.meta) with
+    | Var _, {type_= UArray UInt; adlevel= DataOnly; _} -> true
+    | _ -> false in
+  (* Match elt_multiply(gather(a, i), subtract(gather(t, j), gather(b,
+     i))) — the exact 2PL predictor shape — and return (theta, jj, alpha,
+     beta, ii) in the primitive's parameter order. *)
+  let eta_parts (e : Expr.Typed.t) :
+      (Expr.Typed.t * Expr.Typed.t * Expr.Typed.t * Expr.Typed.t *
+       Expr.Typed.t)
+      option =
+    match e.pattern with
+    | FunApp
+        ( StanLib ("EltTimes__", FnPlain, _)
+        , [ a
+          ; { Expr.pattern=
+                FunApp (StanLib ("Minus__", FnPlain, _), [t; b])
+            ; _ } ] )
+      when (match e.meta with
+           | {type_= UVector; adlevel= AutoDiffable; _} -> true
+           | _ -> false)
+           && (match a.meta with {type_= UVector; _} -> true | _ -> false)
+           && (match t.meta with {type_= UVector; _} -> true | _ -> false)
+           && (match b.meta with {type_= UVector; _} -> true | _ -> false)
+      -> (
+        match (leaf a, leaf t, leaf b) with
+        | Some (alpha, ix1, ii), Some (theta, _jx, jj), Some (beta, ix2, _)
+          when String.equal ix1 ix2 ->
+            Some (theta, jj, alpha, beta, ii)
+        | _ -> None)
+    | _ -> None in
+  let gather_statement p =
+    match p with
+    | Stmt.Pattern.TargetPE
+        ( { Expr.pattern=
+              FunApp
+                ( StanLib (name, (FnLpmf _ as suffix), mem)
+                , [rv; eta] )
+          ; _ } as e )
+      when String.equal name "bernoulli_logit_lpmf" && rv_ok rv -> (
+        match eta_parts eta with
+        | Some (theta, jj, alpha, beta, ii) ->
+            Stmt.Pattern.TargetPE
+              Expr.
+                { e with
+                  pattern=
+                    FunApp
+                      (StanLib (name ^ "_gathered", suffix, mem)
+                      ,[rv; theta; jj; alpha; beta; ii]) }
+        | None -> p)
+    | _ -> p in
+  { mir with
+    reverse_mode_log_prob=
+      List.map mir.reverse_mode_log_prob ~f:(map_rec_stmt_loc gather_statement)
+  }
+
 let collapse_lists_statement _ =
   let rec collapse_lists l =
     match l with
@@ -1363,7 +1479,8 @@ type optimization_settings =
   ; lazy_code_motion: bool
   ; optimize_ad_levels: bool
   ; preserve_stability: bool
-  ; optimize_soa: bool }
+  ; optimize_soa: bool
+  ; gather_bernoulli_logit: bool }
 
 let settings_const b =
   { function_inlining= b
@@ -1381,7 +1498,8 @@ let settings_const b =
   ; lazy_code_motion= b
   ; optimize_ad_levels= b
   ; preserve_stability= not b
-  ; optimize_soa= b }
+  ; optimize_soa= b
+  ; gather_bernoulli_logit= b }
 
 let all_optimizations : optimization_settings = settings_const true
 let no_optimizations : optimization_settings = settings_const false
@@ -1407,7 +1525,8 @@ let level_optimizations (lvl : optimization_level) : optimization_settings =
       ; allow_uninitialized_decls= true
       ; optimize_ad_levels= false
       ; preserve_stability= false
-      ; optimize_soa= true }
+      ; optimize_soa= true
+      ; gather_bernoulli_logit= true }
   | Oexperimental -> all_optimizations
 
 let optimization_suite ?(settings = all_optimizations) mir =
@@ -1458,7 +1577,11 @@ let optimization_suite ?(settings = all_optimizations) mir =
     ; (allow_uninitialized_decls, settings.allow_uninitialized_decls)
       (* Book: Machine idioms and instruction combining *)
       (* Matthijs: Everything < block_fixing *)
-    ; (block_fixing, settings.block_fixing) ] in
+    ; (block_fixing, settings.block_fixing)
+      (* Rewrites the gathered 2PL bernoulli_logit likelihood into the
+         bernoulli_logit_lpmf_gathered primitive call; runs LAST so no
+         other pass rewrites the call it produces. *)
+    ; (gather_bernoulli_logit, settings.gather_bernoulli_logit) ] in
   let optimizations =
     List.filter_map maybe_optimizations ~f:(fun (fn, flag) ->
         if flag then Some fn else None) in
