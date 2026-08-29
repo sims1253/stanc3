@@ -776,6 +776,152 @@ let vectorize_loops (mir : Program.Typed.t) =
         match fd with Some _ -> String.Map.empty | None -> trusted_sizes in
       top_down_map_rec_stmt_loc (vectorize_statement sizes))
 
+(* Hoist the constant-data lgamma term out of poisson-log likelihoods into
+   transformed data (W-124; fork math issue #20, the compute-once/re-add
+   remedy).
+
+   A brms-style count model writes its likelihood as
+   [target += poisson_log_lpmf(y | theta)] (or the _glm_ form brms and the
+   partial evaluator both emit). The [target +=] form instantiates the
+   density with [propto = false], so stan-math recomputes
+   [- sum(lgamma(y + 1))] — a term that depends only on the data — on every
+   log density evaluation, i.e. on every leapfrog step (the W-121 census:
+   109 Ir/elem, 44% of the poisson_log_glm interior). The sampling-statement
+   form drops that term via [include_summand<propto>::value], which is why
+   only the explicit form pays it.
+
+   This pass recognizes, in the reverse-mode log prob only, a
+   [TargetPE] of [poisson_log_lpmf] (2 args) or [poisson_log_glm_lpmf]
+   (4 args) whose first argument is a data integer array read as a bare
+   variable, and rewrites the statement to
+
+   {v[
+     target += <density><propto__>(y, ...);   // constants dropped internally
+     target += y_lgamma_y1__;                 // the precomputed constant
+   ]}
+
+   where [y_lgamma_y1__] is a new transformed-data double declared as
+   [- sum(lgamma(to_vector(y) + 1))] — computed once at data initialization
+   and re-added to the accumulator as a single precomputed term. The full
+   constant value of [lp__] is preserved to summation-order ulps (the
+   constant joins the accumulator as one term instead of being folded inside
+   the density's reduction), while the gradient path stops recomputing
+   lgamma of never-changing data; the constant has exactly zero gradient,
+   so parameter gradients are unaffected. The double-mode instantiation
+   keeps the stock [propto = false] call (the constants belong there), and
+   [~] / [_lupmf] forms — which already drop the constant via
+   [propto = true] — are left alone by matching only the [FnLpmf false]
+   suffix. Adding more families is adding a name to [const_hoist_heads]. *)
+let hoist_const_lgamma (mir : Program.Typed.t) =
+  let data_vars =
+    List.map mir.input_vars ~f:(fun (name, _, _) -> name)
+    |> String.Set.of_list in
+  (* The density heads in scope, with their arity (y included). *)
+  let const_hoist_heads =
+    [ ("poisson_log_lpmf", 2); ("poisson_log_glm_lpmf", 4) ] in
+  let head_ok name args =
+    List.exists
+      ~f:(fun (head, arity) ->
+        String.equal name head && List.length args = arity)
+      const_hoist_heads in
+  (* The random variable: a data integer array, read as a bare variable (a
+     scalar or indexed read broadcasts differently inside the density, and
+     a non-data y — e.g. a transformed-data array — is out of scope). *)
+  let rv_ok (e : Expr.Typed.t) =
+    match (e.pattern, e.meta) with
+    | Var name, {type_= UArray UInt; adlevel= DataOnly; _} ->
+        String.Set.mem name data_vars
+    | _ -> false in
+  let hoist_name (e : Expr.Typed.t) =
+    match e.pattern with
+    | Var name -> name ^ "_lgamma_y1__"
+    | _ -> "lgamma_y1__" in
+  (* A location-free DataOnly metadata of type [ty] for the synthesized
+     transformed-data computation. *)
+  let dmeta ty = {Expr.Typed.Meta.empty with type_= ty} in
+  (* - sum(lgamma(to_vector(y) + 1)) — exactly the constant the densities
+     subtract internally, negated so the re-add is a bare accumulator add.
+     Built from the same StanLib nodes the stock lowering produces for the
+     equivalent Stan source, so it flows through the default backend. *)
+  let const_expr (rv : Expr.Typed.t) : Expr.Typed.t =
+    let y = {rv with meta= dmeta (UArray UInt)} in
+    let one = Expr.{pattern= Lit (Int, "1"); meta= dmeta UInt} in
+    let to_vector_y =
+      Expr.
+        { pattern= FunApp (StanLib ("to_vector", FnPlain, AoS), [y])
+        ; meta= dmeta UVector } in
+    let plus_one =
+      Expr.
+        { pattern=
+            FunApp
+              ( StanLib ("Plus__", FnPlain, AoS)
+              , [to_vector_y; {pattern= Promotion (one, UReal, DataOnly); meta= dmeta UReal}] )
+        ; meta= dmeta UVector } in
+    let lgamma_plus_one =
+      Expr.
+        { pattern= FunApp (StanLib ("lgamma", FnPlain, AoS), [plus_one])
+        ; meta= dmeta UVector } in
+    let sum_lgamma =
+      Expr.
+        { pattern= FunApp (StanLib ("sum", FnPlain, AoS), [lgamma_plus_one])
+        ; meta= dmeta UReal } in
+    Expr.
+      { pattern= FunApp (StanLib ("PMinus__", FnPlain, AoS), [sum_lgamma])
+      ; meta= dmeta UReal } in
+  (* The transformed-data declaration itself: a plain double member,
+     initialized once in the constructor after the data is read. The empty
+     location keeps it invisible to the statement numbering and the
+     location table. *)
+  let hoist_decl (rv : Expr.Typed.t) : Stmt.Located.t =
+    Stmt.
+      { pattern=
+          Decl
+            { decl_adtype= DataOnly
+            ; decl_id= hoist_name rv
+            ; decl_type= Sized SizedType.SReal
+            ; initialize= Assign (const_expr rv) }
+      ; meta= Location_span.empty } in
+  let fired = ref [] in
+  (* Rewrite at the statement level so both statements the rewrite produces
+     carry the original statement's location (no new location labels). *)
+  let rec rewrite_stmt (s : Stmt.Located.t) : Stmt.Located.t =
+    let s =
+      Stmt.{s with pattern= Stmt.Pattern.map Fun.id rewrite_stmt s.pattern} in
+    match s.pattern with
+    | TargetPE
+        ( { Expr.pattern=
+              FunApp (StanLib (name, FnLpmf false, mem), rv :: args)
+          ; _ } as e )
+      when head_ok name (rv :: args) && rv_ok rv ->
+        fired := rv :: !fired;
+        let propto_call =
+          Expr.
+            { e with
+              pattern= FunApp (StanLib (name, FnLpmf true, mem), rv :: args)
+            } in
+        let readd =
+          Expr.{pattern= Var (hoist_name rv); meta= dmeta UReal} in
+        Stmt.
+          { s with
+            pattern=
+              SList
+                [ {pattern= TargetPE propto_call; meta= s.meta}
+                ; {pattern= TargetPE readd; meta= s.meta} ] }
+    | _ -> s in
+  let rev_log_prob =
+    List.map mir.reverse_mode_log_prob ~f:rewrite_stmt in
+  (* One hoisted declaration per distinct data vector, in first-fired
+     order; several likelihoods on the same y reuse it. *)
+  let decls, _seen =
+    List.fold_left !fired ~init:([], String.Set.empty)
+      ~f:(fun (decls, seen) rv ->
+        let name = hoist_name rv in
+        if String.Set.mem name seen then (decls, seen)
+        else (hoist_decl rv :: decls, String.Set.add name seen)) in
+  { mir with
+    reverse_mode_log_prob= rev_log_prob
+  ; prepare_data= mir.prepare_data @ List.rev decls }
+
 let collapse_lists_statement _ =
   let rec collapse_lists l =
     match l with
@@ -1363,7 +1509,8 @@ type optimization_settings =
   ; lazy_code_motion: bool
   ; optimize_ad_levels: bool
   ; preserve_stability: bool
-  ; optimize_soa: bool }
+  ; optimize_soa: bool
+  ; hoist_const_lgamma: bool }
 
 let settings_const b =
   { function_inlining= b
@@ -1381,7 +1528,8 @@ let settings_const b =
   ; lazy_code_motion= b
   ; optimize_ad_levels= b
   ; preserve_stability= not b
-  ; optimize_soa= b }
+  ; optimize_soa= b
+  ; hoist_const_lgamma= b }
 
 let all_optimizations : optimization_settings = settings_const true
 let no_optimizations : optimization_settings = settings_const false
@@ -1407,7 +1555,8 @@ let level_optimizations (lvl : optimization_level) : optimization_settings =
       ; allow_uninitialized_decls= true
       ; optimize_ad_levels= false
       ; preserve_stability= false
-      ; optimize_soa= true }
+      ; optimize_soa= true
+      ; hoist_const_lgamma= true }
   | Oexperimental -> all_optimizations
 
 let optimization_suite ?(settings = all_optimizations) mir =
@@ -1458,7 +1607,12 @@ let optimization_suite ?(settings = all_optimizations) mir =
     ; (allow_uninitialized_decls, settings.allow_uninitialized_decls)
       (* Book: Machine idioms and instruction combining *)
       (* Matthijs: Everything < block_fixing *)
-    ; (block_fixing, settings.block_fixing) ] in
+    ; (block_fixing, settings.block_fixing)
+      (* Hoists the constant-data lgamma term of poisson-log likelihoods
+         into transformed data and rewrites the call to its propto
+         overload; runs LAST so the decls and calls it produces reach the
+         backend untouched. *)
+    ; (hoist_const_lgamma, settings.hoist_const_lgamma) ] in
   let optimizations =
     List.filter_map maybe_optimizations ~f:(fun (fn, flag) ->
         if flag then Some fn else None) in
