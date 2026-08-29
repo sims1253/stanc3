@@ -776,10 +776,80 @@ let vectorize_loops (mir : Program.Typed.t) =
         match fd with Some _ -> String.Map.empty | None -> trusted_sizes in
       top_down_map_rec_stmt_loc (vectorize_statement sizes))
 
-(* Rewrite the gathered 2PL Bernoulli-logit likelihood into the gathered-GLM
-   primitive call (W-108 increment 2).
+(* ================================================================== *)
+(* The gathered-families REGISTRY (W-108 increment 2 + W-115).          *)
+(*                                                                      *)
+(* One table-driven suite pass recognizes the Stan shapes whose         *)
+(* gathered operands stan-math has landed specialized primitives for    *)
+(* (see [Middle.Gathered_families] for the table itself, and the         *)
+(* gathered-GLM campaign records for the bit-identity gates each         *)
+(* primitive shipped with) and rewrites them — in the reverse-mode log   *)
+(* prob only, so the double-mode instantiation keeps the stock           *)
+(* expression (every primitive requires var operands) — into a call to   *)
+(* the primitive, which takes the index vectors instead of the gathered  *)
+(* matrices and is bit-identical to the composed stock expression while  *)
+(* deleting the whole gathered eltwise/loop complex.                     *)
+(*                                                                      *)
+(* Each entry below is one family:                                       *)
+(*   - entry 1, expression class: [y ~ bernoulli_logit(alpha[ii] .*      *)
+(*     (theta[jj] - beta[ii]))] (the W-108 increment-2 pass, unchanged); *)
+(*   - entry 2, expression class: [-(0.5) * dot_self(phi[node1] -        *)
+(*     phi[node2])] — the gathered ICAR prior (W-113); the rewrite only   *)
+(*     replaces the [dot_self] call, everything wrapping it (the -0.5,   *)
+(*     the target +=) stays untouched;                                   *)
+(*   - entry 3, LOOP class (the new matcher class, W-112): the           *)
+(*     stereotyped likelihood loop                                       *)
+(*     [for (n in 1:N) { mu[n] = alpha[ii[n]] [+ x[n] * beta[ii2[n]]];   *)
+(*     target += normal_lpdf(y[n] | mu[n], sigma) }] with [mu]           *)
+(*     loop-local, every index expression depending only on [n], and     *)
+(*     [sigma] loop-invariant.                                           *)
+(*                                                                      *)
+(* Every matcher is conservative: any doubt (an extra statement in the   *)
+(* loop body, a read of [mu] outside it, a write to [y], a non-data      *)
+(* bound, an index expression that is not exactly [idx[n]], a different   *)
+(* density head) means NO rewrite. The C++ backend emits the matching    *)
+(* [#include] (and, for the per-observation families, the per-term       *)
+(* accumulator push loop) only when a rewrite actually fired, so         *)
+(* pattern-free models keep their exact generated code.                  *)
+(* ================================================================== *)
 
-   The IRT likelihood [y ~ bernoulli_logit(alpha[ii] .* (theta[jj] -
+(* Context every matcher works against: the program's data variables, for
+   the index-vector admissibility checks (an index vector must be data so
+   the primitive can read it as ints at runtime). *)
+type gathered_ctx = {data_vars: String.Set.t}
+
+let gathered_ctx_of (mir : Program.Typed.t) =
+  let data_vars =
+    List.map mir.input_vars ~f:(fun (name, _, _) -> name)
+    |> String.Set.of_list in
+  {data_vars}
+
+(* A gathered coefficient leaf: vector_var [ MultiIndex (data int vector
+   var) ]. Returns the bare container var expression, the index variable's
+   name, and the bare index var expression. *)
+let var_name (e : Expr.Typed.t) : string =
+  match e.pattern with Var v -> v | _ -> ""
+
+let gathered_leaf (ctx : gathered_ctx) (e : Expr.Typed.t) :
+    (Expr.Typed.t * string * Expr.Typed.t) option =
+  match e.pattern with
+  | Indexed
+      ( ( { pattern= Var _
+          ; meta= {type_= UVector; adlevel= AutoDiffable; _}
+          ; _ } as container )
+      , [ Index.MultiIndex
+            ( { pattern= Var idx
+              ; meta= {type_= UArray UInt; adlevel= DataOnly; _}
+              ; _ } as index ) ] )
+    when String.Set.mem idx ctx.data_vars ->
+      Some (container, idx, index)
+  | _ -> None
+
+(* ------------------------------------------------------------------ *)
+(* Entry 1 — the gathered 2PL Bernoulli-logit likelihood (W-108 i2).    *)
+(* ------------------------------------------------------------------ *)
+
+(* The IRT likelihood [y ~ bernoulli_logit(alpha[ii] .* (theta[jj] -
    beta[ii]))] lowers in the reverse-mode log prob to
 
    [bernoulli_logit_lpmf(y, elt_multiply(rvalue(alpha, index_multi(ii)),
@@ -793,48 +863,19 @@ let vectorize_loops (mir : Program.Typed.t) =
 
    [bernoulli_logit_lpmf_gathered(y, theta, jj, alpha, beta, ii)]
 
-   (stan-math branch [gathered-glm], W-108 increment 1) takes the index
-   vectors instead of the gathered matrices and is bit-identical to the
-   composed stock expression while removing the whole complex (-40.9%
-   Ir/grad on hier_2pl, W-108 gate (c)). It accepts the operand-mix layouts
-   the compiler actually emits ([var_value] SoA and [Matrix<var>] AoS
-   alike), so the rewrite needs no layout side conditions.
-
-   This pass recognizes exactly that pattern — in the reverse-mode log prob
-   only, so the double-mode instantiation keeps the stock expression (the
-   primitive requires var operands) — and replaces the call, preserving the
-   [propto] suffix and the original call metadata. Gates: the density must
-   be [bernoulli_logit_lpmf] whose random variable is a data integer
-   vector; the second argument must be the literal three-leaf tree
-   [elt_multiply(gather(alpha, ii), subtract(gather(theta, jj),
-   gather(beta, ii)))] over AutoDiffable vector variables multi-indexed by
-   data integer index vectors, with [alpha] and [beta] gathered through the
-   SAME index variable. Everything else is left untouched, and no emitted
-   model changes unless it contains the pattern. The C++ backend emits the
-   matching [#include <stan/math/rev/prob/bernoulli_logit_lpmf_gathered.hpp>]
-   when the rewrite fires, so the generated model compiles against the
-   paired stan-math branch. *)
-let gather_bernoulli_logit (mir : Program.Typed.t) =
-  let data_vars =
-    List.map mir.input_vars ~f:(fun (name, _, _) -> name)
-    |> String.Set.of_list in
-  (* A gathered coefficient leaf: vector_var [ MultiIndex (data int
-     vector var) ]. Returns the bare container var expression, the index
-     variable's name, and the bare index var expression. *)
-  let leaf (e : Expr.Typed.t) :
-      (Expr.Typed.t * string * Expr.Typed.t) option =
-    match e.pattern with
-    | Indexed
-        ( ( { pattern= Var _
-            ; meta= {type_= UVector; adlevel= AutoDiffable; _}
-            ; _ } as container )
-        , [ Index.MultiIndex
-              ( { pattern= Var idx
-                ; meta= {type_= UArray UInt; adlevel= DataOnly; _}
-                ; _ } as index ) ] )
-      when String.Set.mem idx data_vars ->
-        Some (container, idx, index)
-    | _ -> None in
+   takes the index vectors instead of the gathered matrices and is
+   bit-identical to the composed stock expression while removing the whole
+   complex (-40.9% Ir/grad on hier_2pl, W-108 gate (c)). It accepts the
+   operand-mix layouts the compiler actually emits ([var_value] SoA and
+   [Matrix<var>] AoS alike), so the rewrite needs no layout side
+   conditions. Gates: the density must be [bernoulli_logit_lpmf] whose
+   random variable is a data integer vector; the second argument must be
+   the literal three-leaf tree [elt_multiply(gather(alpha, ii),
+   subtract(gather(theta, jj), gather(beta, ii)))] over AutoDiffable
+   vector variables multi-indexed by data integer index vectors, with
+   [alpha] and [beta] gathered through the SAME index variable. *)
+let bernoulli_logit_statement (ctx : gathered_ctx) p =
+  let leaf = gathered_leaf ctx in
   (* The random variable: a data integer vector. *)
   let rv_ok (e : Expr.Typed.t) =
     match (e.pattern, e.meta) with
@@ -867,30 +908,472 @@ let gather_bernoulli_logit (mir : Program.Typed.t) =
             Some (theta, jj, alpha, beta, ii)
         | _ -> None)
     | _ -> None in
-  let gather_statement p =
-    match p with
-    | Stmt.Pattern.TargetPE
-        ( { Expr.pattern=
-              FunApp
-                ( StanLib (name, (FnLpmf _ as suffix), mem)
-                , [rv; eta] )
-          ; _ } as e )
-      when String.equal name "bernoulli_logit_lpmf" && rv_ok rv -> (
-        match eta_parts eta with
-        | Some (theta, jj, alpha, beta, ii) ->
-            Stmt.Pattern.TargetPE
-              Expr.
-                { e with
-                  pattern=
-                    FunApp
-                      (StanLib (name ^ "_gathered", suffix, mem)
-                      ,[rv; theta; jj; alpha; beta; ii]) }
-        | None -> p)
-    | _ -> p in
-  { mir with
-    reverse_mode_log_prob=
-      List.map mir.reverse_mode_log_prob ~f:(map_rec_stmt_loc gather_statement)
+  match p with
+  | Stmt.Pattern.TargetPE
+      ( { Expr.pattern=
+            FunApp (StanLib (name, (FnLpmf _ as suffix), mem), [rv; eta])
+        ; _ } as e )
+    when String.equal name "bernoulli_logit_lpmf" && rv_ok rv -> (
+      match eta_parts eta with
+      | Some (theta, jj, alpha, beta, ii) ->
+          Stmt.Pattern.TargetPE
+            Expr.
+              { e with
+                pattern=
+                  FunApp
+                    (StanLib (name ^ "_gathered", suffix, mem)
+                    ,[rv; theta; jj; alpha; beta; ii]) }
+      | None -> p)
+  | _ -> p
+
+(* ------------------------------------------------------------------ *)
+(* Entry 2 — the gathered ICAR prior, dot_self (W-113).                 *)
+(* ------------------------------------------------------------------ *)
+
+(* The BYM2 ICAR line [target += -0.5 * dot_self(phi[node1] - phi[node2])]
+   lowers to [Times__(-0.5, dot_self(Minus__(rvalue(phi, index_multi
+   (node1)), rvalue(phi, index_multi(node2)))))]. The primitive
+   [dot_self_gathered_diff(phi, node1, node2)] replaces exactly the
+   [dot_self] call over a difference of two gathers of the SAME
+   AutoDiffable vector through data integer index vectors; the -0.5 and
+   whatever else wraps the call are left untouched, and the operand layout
+   is left to the C++ overload set (the primitive is bit-exact on all three
+   layouts the compiler emits, W-113 gate (a)). *)
+let dot_self_gathered_diff_expr (ctx : gathered_ctx) (e : Expr.Typed.t) :
+    Expr.Typed.t =
+  match e.pattern with
+  | FunApp
+      ( StanLib ("dot_self", FnPlain, mem)
+      , [ { Expr.pattern=
+              FunApp (StanLib ("Minus__", FnPlain, _), [a; b])
+          ; _ } ] )
+    when (match e.meta with
+         | {type_= UReal; adlevel= AutoDiffable; _} -> true
+         | _ -> false)
+         && (match a.meta with {type_= UVector; _} -> true | _ -> false)
+         && (match b.meta with {type_= UVector; _} -> true | _ -> false)
+         && String.equal (var_name a) (var_name b) -> (
+      match (gathered_leaf ctx a, gathered_leaf ctx b) with
+      | Some (g1, _, i1), Some (_, _, i2) ->
+          Expr.
+            { e with
+              pattern=
+                FunApp
+                  ( StanLib ("dot_self_gathered_diff", FnPlain, mem)
+                  , [g1; i1; i2] ) }
+      | _ -> e)
+  | _ -> e
+
+(* Rewrite every subexpression of every statement in the list, bottom-up. *)
+let rec dot_self_rewrite_stmt (ctx : gathered_ctx) (s : Stmt.Located.t) :
+    Stmt.Located.t =
+  let rec go_expr (e : Expr.Typed.t) : Expr.Typed.t =
+    let children_mapped =
+      Expr.{e with pattern= Expr.Pattern.map go_expr e.pattern} in
+    dot_self_gathered_diff_expr ctx children_mapped in
+  let go_pattern (p : (Expr.Typed.t, Stmt.Located.t) Stmt.Pattern.t) =
+    Stmt.Pattern.map go_expr (dot_self_rewrite_stmt ctx) p in
+  {s with pattern= go_pattern s.pattern}
+
+(* ------------------------------------------------------------------ *)
+(* Entry 3 — the loop-form normal likelihood (W-112), the LOOP class.   *)
+(* ------------------------------------------------------------------ *)
+
+(* The matched shape, exactly as the reverse-mode log prob of
+
+     vector[N] mu;
+     for (n in 1:N) {
+       mu[n] = alpha[ii[n]];                     // shape A
+       mu[n] = alpha[ii[n]] + x[n] * beta[ii2[n]];  // shape B
+       target += normal_lpdf(y[n] | mu[n], sigma);
+     }
+
+   lowers (shape B appears both as the plain mul-add and, once the O1
+   multiply-add fusion has run, as [fma(x[n], beta[ii2[n]], alpha[ii[n]])]).
+   The primitive
+
+     normal_lpdf_gathered<propto>(y, alpha, ii [, x, beta, ii2], sigma)
+
+   returns ONE VAR PER OBSERVATION (the accumulator<var> chunk-collapse
+   buffer forces that, W-112 §2), so the generated model pushes each term
+   into [lp_accum__] in n order — the backend emits that loop; here we only
+   replace the whole [for] statement with the primitive's [target +=] call
+   and delete the now-unused [mu] declaration (replaced by a [Skip] that
+   keeps the statement-numbering labels stable). *)
+
+(* A coefficient leaf indexed by the loop variable: <coef>[<idx>[n]]. *)
+let normal_coef_leaf (ctx : gathered_ctx) n (e : Expr.Typed.t) :
+    (Expr.Typed.t * Expr.Typed.t) option =
+  match e.pattern with
+  | Indexed
+      ( ( { pattern= Var _
+          ; meta= {type_= UVector; adlevel= AutoDiffable; _}
+          ; _ } as coef )
+      , [ Index.Single
+            { Expr.pattern=
+                Indexed
+                  ( ( { pattern= Var idx
+                      ; meta= {type_= UArray UInt; adlevel= DataOnly; _}
+                      ; _ } as index )
+                  , [Index.Single {pattern= Var nv; _}] )
+            ; _ } ] )
+    when String.equal nv n && String.Set.mem idx ctx.data_vars ->
+      Some (coef, index)
+  | _ -> None
+
+(* A data-vector leaf indexed by the loop variable: x[n]. *)
+let normal_x_leaf (ctx : gathered_ctx) n (e : Expr.Typed.t) :
+    Expr.Typed.t option =
+  match e.pattern with
+  | Indexed
+      ( ( { pattern= Var x
+          ; meta= {type_= UVector; adlevel= DataOnly; _}
+          ; _ } as xv )
+      , [Index.Single {pattern= Var nv; _}] )
+    when String.equal nv n && String.Set.mem x ctx.data_vars ->
+      Some xv
+  | _ -> None
+
+type normal_eta =
+  | EtaIntercept of Expr.Typed.t * Expr.Typed.t  (* alpha, ii *)
+  | EtaSlope of Expr.Typed.t * Expr.Typed.t * Expr.Typed.t * Expr.Typed.t
+                 * Expr.Typed.t  (* alpha, ii, x, beta, ii2 *)
+
+let normal_eta (ctx : gathered_ctx) n (e : Expr.Typed.t) : normal_eta option
+    =
+  let slope a x b =
+    match
+      (normal_coef_leaf ctx n a, normal_x_leaf ctx n x, normal_coef_leaf ctx n b)
+    with
+    | Some (alpha, ii), Some xv, Some (beta, ii2) ->
+        Some (EtaSlope (alpha, ii, xv, beta, ii2))
+    | _ -> None in
+  match e.pattern with
+  | (* the fused O1 form: fma(x[n], beta[ii2[n]], alpha[ii[n]]) *)
+    FunApp (StanLib ("fma", FnPlain, _), [x; b; a]) -> slope a x b
+  | (* the unfused form: alpha[ii[n]] + x[n] * beta[ii2[n]] *)
+    FunApp
+      ( StanLib ("Plus__", FnPlain, _)
+      , [ a
+        ; { Expr.pattern=
+              FunApp (StanLib ("Times__", FnPlain, _), [x; b])
+          ; _ } ] )
+    -> slope a x b
+  | _ -> (
+      match normal_coef_leaf ctx n e with
+      | Some (alpha, ii) -> Some (EtaIntercept (alpha, ii))
+      | None -> None)
+
+type normal_loop =
+  { nl_mu: string  (* the loop-local linear predictor *)
+  ; nl_y: Expr.Typed.t  (* the data random-variable container *)
+  ; nl_eta: normal_eta
+  ; nl_sigma: Expr.Typed.t  (* loop-invariant scale *)
+  ; nl_suffix: bool Fun_kind.suffix
+  ; nl_mem: Mem_pattern.t
+  ; nl_tpe: Expr.Typed.t  (* the matched TargetPE expression *)
+  ; nl_meta_asg: Stmt.Located.Meta.t  (* the loop's assignment statement *)
+  ; nl_meta_tpe: Stmt.Located.Meta.t  (* the loop's density statement *)
+  ; nl_meta_block: Stmt.Located.Meta.t  (* the loop's body block *)
   }
+
+(* Every variable name read inside an expression. *)
+let rec expr_var_names (acc : string list ref) (e : Expr.Typed.t) =
+  (match e.pattern with Var v -> acc := v :: !acc | _ -> ());
+  ignore (Expr.Pattern.map (expr_var_names acc) e.pattern)
+
+let index_exprs (i : Expr.Typed.t Index.t) : Expr.Typed.t list =
+  match i with
+  | All -> []
+  | Single e | Upfrom e | MultiIndex e -> [e]
+  | Between (a, b) -> [a; b]
+
+(* Every variable name read or written by a statement (lvalue bases
+   included; declarations are not occurrences). *)
+let rec stmt_var_names (acc : string list ref) (s : Stmt.Located.t) =
+  let rec go_lvalue ((lb, idcs) : Expr.Typed.t Stmt.Pattern.lvalue) =
+    (match lb with
+    | LVariable v -> acc := v :: !acc
+    | LTupleProjection (lv, _) -> go_lvalue lv);
+    List.iter
+      ~f:(fun i -> List.iter ~f:(expr_var_names acc) (index_exprs i))
+      idcs in
+  (match s.pattern with
+  | Assignment (lv, _, _) -> go_lvalue lv
+  | _ -> ());
+  ignore
+    (Stmt.Pattern.map
+       (fun e -> expr_var_names acc e; e)
+       (fun x -> stmt_var_names acc x; x)
+       s.pattern)
+
+let vars_of_stmts (stmts : Stmt.Located.t list) : string list =
+  let acc = ref [] in
+  List.iter ~f:(stmt_var_names acc) stmts;
+  !acc
+
+(* The lvalue bases this statement writes to (recursively). *)
+let rec stmt_written_vars (acc : string list ref) (s : Stmt.Located.t) =
+  let rec go_lvalue ((lb, _) : Expr.Typed.t Stmt.Pattern.lvalue) =
+    (match lb with
+    | LVariable v -> acc := v :: !acc
+    | LTupleProjection (lv, _) -> go_lvalue lv) in
+  (match s.pattern with
+  | Assignment (lv, _, _) -> go_lvalue lv
+  | _ -> ());
+  ignore
+    (Stmt.Pattern.map
+       Fun.id
+       (fun x -> stmt_written_vars acc x; x)
+       s.pattern)
+
+let written_vars_of_stmts (stmts : Stmt.Located.t list) : string list =
+  let acc = ref [] in
+  List.iter ~f:(stmt_written_vars acc) stmts;
+  !acc
+
+(* Does [s] mention the variable [v] (read or write), looking through nested
+   statements, but treating [skip1], [skip2] and everything inside them as
+   invisible? Used for the loop matcher's "[mu] is mentioned nowhere else"
+   side condition, where the skipped statements are the matched loop itself
+   and its [mu] declaration — both of which do mention [mu] by
+   construction. *)
+let rec stmt_mentions_var_skipping (v : string) (skip1 : Stmt.Located.t)
+    (skip2 : Stmt.Located.t) (s : Stmt.Located.t) : bool =
+  if s == skip1 || s == skip2 then false
+  else
+    let acc = ref false in
+    let rec go_expr (e : Expr.Typed.t) =
+      (match e.pattern with
+      | Var x when String.equal x v -> acc := true
+      | _ -> ());
+      if not !acc then ignore (Expr.Pattern.map go_expr e.pattern) in
+    let rec go_lvalue ((lb, idcs) : Expr.Typed.t Stmt.Pattern.lvalue) =
+      (match lb with
+      | LVariable x -> if String.equal x v then acc := true
+      | LTupleProjection (lv, _) -> go_lvalue lv);
+      if not !acc then
+        List.iter ~f:(fun i -> List.iter ~f:go_expr (index_exprs i)) idcs in
+    let go_stmt (x : Stmt.Located.t) =
+      (if (not !acc) && stmt_mentions_var_skipping v skip1 skip2 x then
+         acc := true);
+      x in
+    (match s.pattern with
+    | Assignment (lv, _, rhs) ->
+        go_lvalue lv;
+        if not !acc then go_expr rhs
+    | _ -> ());
+    if !acc then true
+    else (
+      ignore (Stmt.Pattern.map go_expr go_stmt s.pattern);
+      !acc)
+
+(* Match the [for] statement itself; the whole-program side conditions
+   ([mu] loop-local and otherwise unused, [y] never written) are checked by
+   the caller, which sees the whole reverse-mode log prob. *)
+let match_normal_loop (ctx : gathered_ctx)
+    (pat : (Expr.Typed.t, Stmt.Located.t) Stmt.Pattern.t) :
+    normal_loop option =
+  match pat with
+  | For
+      { loopvar= n
+      ; lower= {Expr.pattern= Lit (Int, "1"); _}
+      ; upper= {meta= {type_= UInt; adlevel= DataOnly; _}; _}
+      ; body=
+          ( { pattern=
+                Block
+                  [ ( { pattern=
+                          Assignment
+                            ( (LVariable mu, [Index.Single {pattern= Var nv; _}])
+                            , _
+                            , ({meta= {type_= UReal; adlevel= AutoDiffable; _}; _}
+                              as eta) )
+                      ; meta= m_asg } )
+                  ; { pattern=
+                        TargetPE
+                          ( { Expr.pattern=
+                                FunApp
+                                  ( StanLib (name, (FnLpdf _ as suffix), mem)
+                                  , [y_n; mu_n; sigma] )
+                            ; _ } as tpe )
+                    ; meta= m_tpe } ]
+            ; meta= m_block } as body ) }
+    when String.equal nv n && String.equal name "normal_lpdf" -> (
+      ignore body;
+      let y_ok =
+        match y_n.pattern with
+        | Indexed
+            ( ( { pattern= Var y
+                ; meta= {type_= UVector; adlevel= DataOnly; _}
+                ; _ } as yv )
+            , [Index.Single {pattern= Var ny; _}] )
+          when String.equal ny n && String.Set.mem y ctx.data_vars ->
+            Some yv
+        | _ -> None in
+      let mu_ok =
+        match mu_n.pattern with
+        | Indexed
+            ( { pattern= Var mv
+              ; meta= {type_= UVector; adlevel= AutoDiffable; _}
+              ; _ }
+            , [Index.Single {pattern= Var nm; _}] )
+          when String.equal nm n && String.equal mv mu ->
+            Some ()
+        | _ -> None in
+      let sigma_ok =
+        let names = ref [] in
+        expr_var_names names sigma;
+        (match sigma.meta with
+        | {type_= UReal; _} -> true | _ -> false)
+        && not
+             (List.exists !names ~f:(fun v ->
+                  String.equal v n || String.equal v mu)) in
+      match (y_ok, mu_ok, sigma_ok, normal_eta ctx n eta) with
+      | Some y, Some (), true, Some e ->
+          Some
+            { nl_mu= mu
+            ; nl_y= y
+            ; nl_eta= e
+            ; nl_sigma= sigma
+            ; nl_suffix= suffix
+            ; nl_mem= mem
+            ; nl_tpe= tpe
+            ; nl_meta_asg= m_asg
+            ; nl_meta_tpe= m_tpe
+            ; nl_meta_block= m_block }
+      | _ -> None)
+  | _ -> None
+
+(* Rewrite one matched loop into the primitive's [target +=] call.
+
+   The [for] is replaced by an [SList] of no-op [Skip]s carrying the loop's
+   interior statement locations plus the [target +=] call carrying the
+   [for]'s own location: the backend's statement numbering registers every
+   statement location in traversal order, so this keeps the labels (and
+   therefore every printed [current_statement__] number and the whole
+   [locations_array__]) EXACTLY what the un-rewritten program would have
+   printed, while emitting only the call. *)
+let rewrite_normal_loop (m : normal_loop) (for_stmt : Stmt.Located.t) :
+    Stmt.Located.t =
+  let args =
+    match m.nl_eta with
+    | EtaIntercept (alpha, ii) -> [m.nl_y; alpha; ii; m.nl_sigma]
+    | EtaSlope (alpha, ii, x, beta, ii2) ->
+        [m.nl_y; alpha; ii; x; beta; ii2; m.nl_sigma] in
+  let call =
+    Expr.
+      { m.nl_tpe with
+        pattern=
+          FunApp (StanLib ("normal_lpdf_gathered", m.nl_suffix, m.nl_mem), args)
+      } in
+  { for_stmt with
+    pattern=
+      Stmt.Pattern.SList
+      [ {pattern= Stmt.Pattern.Skip; meta= m.nl_meta_asg}
+      ; {pattern= Stmt.Pattern.Skip; meta= m.nl_meta_tpe}
+      ; {pattern= Stmt.Pattern.Skip; meta= m.nl_meta_block}
+      ; {pattern= Stmt.Pattern.TargetPE call; meta= for_stmt.meta} ] }
+
+(* One entry's statement-list rewriter: match the loops, check the
+   whole-program side conditions, replace the [for] with the call and the
+   [mu] declaration with a no-op [Skip] that keeps the location labels (and
+   therefore every printed [current_statement__] number) unchanged.
+
+   Side conditions, all of which must hold or nothing fires: [y] is never
+   written anywhere in the reverse-mode log prob; [mu] has exactly one
+   declaration (a sibling of the loop in the same statement list) and is
+   mentioned NOWHERE else in the whole reverse-mode log prob outside that
+   declaration and the loop itself. *)
+let normal_loops_rewrite (ctx : gathered_ctx) (prog : Stmt.Located.t list) :
+    Stmt.Located.t list =
+  let written = written_vars_of_stmts prog in
+  let y_writable y = List.exists written ~f:(String.equal y) in
+  let mentions_outside mu for_stmt decl_stmt =
+    List.exists prog ~f:(stmt_mentions_var_skipping mu for_stmt decl_stmt) in
+  let is_mu_decl mu (s : Stmt.Located.t) =
+    match s.pattern with
+    | Decl {decl_id; initialize; _} -> (
+        match initialize with
+        | Default | Uninit -> String.equal decl_id mu
+        | Assign _ -> false)
+    | _ -> false in
+  (* Fire once in this list: find the first [for] that matches and whose
+     [mu] declaration is a sibling in the same statement list. *)
+  let fire (l : Stmt.Located.t list) :
+      (Stmt.Located.t list * Stmt.Located.t) option =
+    let fired = ref None in
+    let l' =
+      List.map l ~f:(fun (s : Stmt.Located.t) ->
+          if Option.is_some !fired then s
+          else
+            let matched = match_normal_loop ctx s.pattern in
+            (match matched with
+            | Some m when not (y_writable (var_name m.nl_y)) -> (
+                let decls = List.filter l ~f:(is_mu_decl m.nl_mu) in
+                match decls with
+                | [d]
+                  when not (mentions_outside m.nl_mu s d)
+                       && List.for_all
+                            ~f:(fun x ->
+                              let names = vars_of_stmts [x] in
+                              not (List.exists names ~f:(String.equal m.nl_mu)))
+                            (List.filter l ~f:(fun x ->
+                                 not (is_mu_decl m.nl_mu x) && not (x == s)))
+                    ->
+                    fired := Some d;
+                    rewrite_normal_loop m s
+                | _ -> s)
+            | _ -> s)) in
+    match !fired with Some d -> Some (l', d) | None -> None in
+  (* Fire repeatedly (a model may have several such loops) and recurse into
+     nested blocks. *)
+  let rec rewrite_stmt (s : Stmt.Located.t) : Stmt.Located.t =
+    match s.pattern with
+    | Block l -> {s with pattern= Block (rewrite_list l)}
+    | SList l -> {s with pattern= SList (rewrite_list l)}
+    | For f ->
+        let body' = rewrite_stmt f.body in
+        {s with pattern= For {f with body= body'}}
+    | IfElse (c, t, e) ->
+        let e' = Option.map ~f:rewrite_stmt e in
+        {s with pattern= IfElse (c, rewrite_stmt t, e')}
+    | While (c, b) -> {s with pattern= While (c, rewrite_stmt b)}
+    | Profile (nm, ls) ->
+        {s with pattern= Profile (nm, List.map ~f:rewrite_stmt ls)}
+    | _ -> s
+  and rewrite_list l =
+    (* Try to fire on the ORIGINAL statements of this list first: [fire]'s
+       whole-program side conditions identify the matched loop and its [mu]
+       declaration by physical equality against the untouched program. *)
+    match fire l with
+    | Some (l', d) ->
+        rewrite_list
+          (List.map l' ~f:(fun s ->
+               if s == d then {s with pattern= Stmt.Pattern.Skip} else s))
+    | None -> List.map ~f:rewrite_stmt l in
+  rewrite_list prog
+
+(* The registry: one row per landed family, in emission order. Each rewrite
+   sees the statement list of [reverse_mode_log_prob] only. *)
+let gathered_registry :
+    (string * (gathered_ctx -> Stmt.Located.t list -> Stmt.Located.t list))
+    list =
+  [ ( "bernoulli_logit_lpmf_gathered"
+    , fun ctx stmts ->
+        List.map stmts ~f:(map_rec_stmt_loc (bernoulli_logit_statement ctx))
+    )
+  ; ( "dot_self_gathered_diff"
+    , fun ctx stmts -> List.map stmts ~f:(dot_self_rewrite_stmt ctx) )
+  ; ("normal_lpdf_gathered", normal_loops_rewrite) ]
+
+(* The suite pass: apply every registered family to the reverse-mode log
+   prob. *)
+let gathered_families (mir : Program.Typed.t) =
+  let ctx = gathered_ctx_of mir in
+  let prog =
+    List.fold_left gathered_registry ~init:mir.reverse_mode_log_prob
+      ~f:(fun stmts (_, rewrite) -> rewrite ctx stmts) in
+  {mir with reverse_mode_log_prob= prog}
 
 let collapse_lists_statement _ =
   let rec collapse_lists l =
@@ -1480,7 +1963,7 @@ type optimization_settings =
   ; optimize_ad_levels: bool
   ; preserve_stability: bool
   ; optimize_soa: bool
-  ; gather_bernoulli_logit: bool }
+  ; gathered_families: bool }
 
 let settings_const b =
   { function_inlining= b
@@ -1499,7 +1982,7 @@ let settings_const b =
   ; optimize_ad_levels= b
   ; preserve_stability= not b
   ; optimize_soa= b
-  ; gather_bernoulli_logit= b }
+  ; gathered_families= b }
 
 let all_optimizations : optimization_settings = settings_const true
 let no_optimizations : optimization_settings = settings_const false
@@ -1526,7 +2009,7 @@ let level_optimizations (lvl : optimization_level) : optimization_settings =
       ; optimize_ad_levels= false
       ; preserve_stability= false
       ; optimize_soa= true
-      ; gather_bernoulli_logit= true }
+      ; gathered_families= true }
   | Oexperimental -> all_optimizations
 
 let optimization_suite ?(settings = all_optimizations) mir =
@@ -1578,10 +2061,11 @@ let optimization_suite ?(settings = all_optimizations) mir =
       (* Book: Machine idioms and instruction combining *)
       (* Matthijs: Everything < block_fixing *)
     ; (block_fixing, settings.block_fixing)
-      (* Rewrites the gathered 2PL bernoulli_logit likelihood into the
-         bernoulli_logit_lpmf_gathered primitive call; runs LAST so no
-         other pass rewrites the call it produces. *)
-    ; (gather_bernoulli_logit, settings.gather_bernoulli_logit) ] in
+      (* The gathered-families registry: rewrites every registered gathered
+         Stan shape (bernoulli_logit 2PL, ICAR dot_self, the loop-form
+         normal likelihood) into its primitive call; runs LAST so no other
+         pass rewrites the calls it produces. *)
+    ; (gathered_families, settings.gathered_families) ] in
   let optimizations =
     List.filter_map maybe_optimizations ~f:(fun (fn, flag) ->
         if flag then Some fn else None) in

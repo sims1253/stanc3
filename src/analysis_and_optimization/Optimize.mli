@@ -23,12 +23,17 @@ val list_collapsing : Program.Typed.t -> Program.Typed.t
 (** Remove redundant SList constructors from the Mir that might have been
     introduced by other optimizations *)
 
-val gather_bernoulli_logit : Program.Typed.t -> Program.Typed.t
-(** Rewrite the gathered 2PL likelihood [bernoulli_logit_lpmf(y,
-    alpha[ii] .* (theta[jj] - beta[ii]))] in the reverse-mode log prob into
-    a call to the [bernoulli_logit_lpmf_gathered] primitive, which takes
-    the index vectors instead of the gathered matrices (bit-identical, W-108
-    increment 1). Non-matching likelihoods are left unchanged *)
+val gathered_families : Program.Typed.t -> Program.Typed.t
+(** The gathered-families registry pass: rewrite every registered gathered
+    Stan shape in the reverse-mode log prob into a call to its paired
+    stan-math primitive, which takes the index vectors instead of the
+    gathered matrices (bit-identical; see [Middle.Gathered_families] for
+    the table). Registered families: the 2PL likelihood
+    [bernoulli_logit_lpmf(y, alpha[ii] .* (theta[jj] - beta[ii]))] (W-108),
+    the gathered ICAR prior [-0.5 * dot_self(phi[node1] - phi[node2])]
+    (W-113), and the loop-form normal likelihood [for (n in 1:N) { mu[n] =
+    alpha[ii[n]] [+ x[n] * beta[ii2[n]]]; target += normal_lpdf(y[n] |
+    mu[n], sigma) }] (W-112). Non-matching code is left unchanged *)
 
 val block_fixing : Program.Typed.t -> Program.Typed.t
 (** Make sure that SList constructors directly under if, for, while or fundef
@@ -93,7 +98,7 @@ type optimization_settings =
   ; optimize_ad_levels: bool
   ; preserve_stability: bool
   ; optimize_soa: bool
-  ; gather_bernoulli_logit: bool }
+  ; gathered_families: bool }
 
 val all_optimizations : optimization_settings
 val no_optimizations : optimization_settings
