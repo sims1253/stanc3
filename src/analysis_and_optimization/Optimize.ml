@@ -776,6 +776,276 @@ let vectorize_loops (mir : Program.Typed.t) =
         match fd with Some _ -> String.Map.empty | None -> trusted_sizes in
       top_down_map_rec_stmt_loc (vectorize_statement sizes))
 
+(* Rewrite everyday linear-predictor normal likelihoods into
+   [normal_id_glm_lpdf] calls (W-128).
+
+   The hand-written Stan regression idiom
+
+   {[
+     y ~ normal(beta[1] + beta[2] * x, sigma);
+   ]}
+
+   with a data vector [x] never reaches the GLM path in stock stanc3 at any
+   optimization level: the partial evaluator's normal->glm rewrite requires a
+   [UMatrix] predictor and only runs where [partial_evaluation] is on (--O1+),
+   and at --O1 its own multiply-add fusion first turns the predictor into
+   [fma(beta[2], x, beta[1])], which that rewrite does not recognize. The
+   likelihood is therefore evaluated through the elementwise autodiff path,
+   paying its materialization and edge overhead and forgoing the GLM's
+   analytic gradients (~50.7 vs ~18-20 Ir/elem forward with a ~free reverse
+   pass, W-117/W-119/W-121).
+
+   This pass recognizes the linear-predictor shapes in the reverse-mode log
+   prob only (the double-mode instantiation keeps the stock expression) and
+   rewrites the call, preserving the [propto] suffix and the original call
+   metadata:
+
+   - matrix predictors [x * beta], [alpha + x * beta], [x * beta + alpha]
+     with [x] a matrix (stock --O1 behavior, now also at the default level);
+   - data-vector predictors: a +-chain of scalar-scaled data column vectors
+     (the kidscore/logmesquite class), at any --O1-fused [fma] spelling of
+     the same chain. A single predictor passes the vector directly as the
+     design (stan-math's [require_matrix_t<T_x>] accepts Eigen column
+     vectors and [x.rows()/x.cols()] give the K=1 design semantics; a
+     scalar weight also binds), so K=1 is a plain call with no wrapper.
+     Two or more predictors synthesize the design matrix with
+     [append_col(x2, append_col(...))] and the weight vector with a vector
+     literal - both standard library shapes the stock lowering emits for
+     the equivalent Stan source.
+
+   Gates, tightened on purpose for this increment: the random variable must
+   be a bare data (or transformed-data) vector; [sigma] must be scalar; each
+   predictor must be a bare data column vector (a bare [Minus] of a whole
+   vector, nonlinear predictors, and parameter-vector predictors do not
+   fire). Non-normal heads are untouched. STATISTICAL DISCLOSURE: the GLM
+   interior computes analytically-simplified gradients and a differently
+   associated log-density, so emitted models change numerics at the last-ulp
+   to 1e-14 class (W-34-ArmB gate class); an upstream submission would gate
+   this behind --Oexperimental until that is settled. *)
+(* One flattened predictor term: a scalar slope times a data column vector
+   (slope kept first), or a scalar intercept. *)
+type glm_term = Intercept of Expr.Typed.t | Slope of Expr.Typed.t * Expr.Typed.t
+
+let emit_normal_glm (mir : Program.Typed.t) =
+  let is_scalar (e : Expr.Typed.t) =
+    match e.meta with {type_= UReal; _} -> true | _ -> false
+  in
+  let is_autodiff (e : Expr.Typed.t) =
+    match e.meta with {adlevel= AutoDiffable; _} -> true | _ -> false
+  in
+  let matrix_x_ok (e : Expr.Typed.t) =
+    (match e.meta with {type_= UMatrix; _} -> true | _ -> false)
+  in
+  let vector_ok (e : Expr.Typed.t) =
+    (match e.meta with {type_= UVector; _} -> true | _ -> false)
+  in
+  let data_vector (e : Expr.Typed.t) =
+    match (e.pattern, e.meta) with
+    | Var _, {type_= UVector; adlevel= DataOnly; _} -> true
+    | _ -> false
+  in
+  let negate (e : Expr.Typed.t) =
+    Expr.
+      { e with
+        pattern= FunApp (StanLib ("PMinus__", FnPlain, AoS), [e]) }
+  in
+  let slope_term ~neg (s : Expr.Typed.t) x : glm_term =
+    Slope ((if neg then negate s else s), x)
+  in
+  (* Flatten the +-chain (or its --O1 fma spelling) into terms. [acc] is
+     reversed; returns None on any shape outside the pattern. *)
+  let rec flatten (e : Expr.Typed.t) (acc : glm_term list) :
+      glm_term list option =
+    let open Option.Syntax in
+    match e.pattern with
+    | FunApp (StanLib ("Plus__", FnPlain, _), [a; b]) ->
+        let* acc = flatten a acc in
+        flatten b acc
+    | FunApp (StanLib ("Minus__", FnPlain, _), [a; b]) -> (
+        match b.pattern with
+        | FunApp (StanLib ("Times__", FnPlain, _), [s; x])
+          when is_scalar s && data_vector x ->
+            flatten a (slope_term ~neg:true s x :: acc)
+        | FunApp (StanLib ("Times__", FnPlain, _), [x; s])
+          when data_vector x && is_scalar s ->
+            flatten a (slope_term ~neg:true s x :: acc)
+        | _ when is_scalar b -> flatten a (Intercept (negate b) :: acc)
+        | _ -> None)
+    | FunApp (StanLib ("Times__", FnPlain, _), [s; x])
+      when is_scalar s && data_vector x ->
+        Some (slope_term ~neg:false s x :: acc)
+    | FunApp (StanLib ("Times__", FnPlain, _), [x; s])
+      when data_vector x && is_scalar s ->
+        Some (slope_term ~neg:false s x :: acc)
+    | FunApp (StanLib ("fma", FnPlain, _), [s; x; z])
+      when is_scalar s && data_vector x ->
+        let* acc = flatten z acc in
+        Some (slope_term ~neg:false s x :: acc)
+    | FunApp (StanLib ("fma", FnPlain, _), [x; s; z])
+      when data_vector x && is_scalar s ->
+        let* acc = flatten z acc in
+        Some (slope_term ~neg:false s x :: acc)
+    | _ when is_scalar e -> Some (Intercept e :: acc)
+    | _ -> None
+  in
+  (* Design + weight arguments for the collected slope terms (source
+     order): K = 1 passes the vector and the scalar weight directly; K >= 2
+     wraps with append_col and a vector literal - standard library shapes
+     the stock backend emits for the equivalent Stan source. *)
+  let dmeta ty ad = {Expr.Typed.Meta.empty with type_= ty; adlevel= ad} in
+  let append_col a b =
+    Expr.
+      { pattern= FunApp (StanLib ("append_col", FnPlain, AoS), [a; b])
+      ; meta= dmeta UMatrix UnsizedType.DataOnly }
+  in
+  let design_and_weights (terms : glm_term list) :
+      (Expr.Typed.t * Expr.Typed.t) option =
+    let slopes =
+      List.filter_map terms ~f:(function
+        | Slope (s, x) -> Some (s, x)
+        | Intercept _ -> None)
+    in
+    match List.rev slopes with
+    | [] -> None
+    | [(s, x)] -> Some (x, s)
+    | (s0, x0) :: rest ->
+        let adlevel =
+          if List.exists slopes ~f:(fun (s, _) -> is_autodiff s) then
+            UnsizedType.AutoDiffable
+          else UnsizedType.DataOnly
+        in
+        let design =
+          List.fold_left rest ~init:x0 ~f:(fun acc (_, x) ->
+              append_col acc x)
+        in
+        let row =
+          Expr.
+            { pattern=
+                FunApp
+                  ( CompilerInternal Internal_fun.FnMakeRowVec
+                  , s0 :: List.map rest ~f:fst )
+            ; meta= dmeta URowVector adlevel }
+        in
+        let weights =
+          Expr.
+            { pattern=
+                FunApp
+                  ( StanLib (Operator.to_string Operator.Transpose, FnPlain, AoS)
+                  , [row] )
+            ; meta= dmeta UVector adlevel }
+        in
+        Some (design, weights)
+  in
+  (* Intercept: the single scalar term, or literal zero. *)
+  let alpha_of (terms : glm_term list) : Expr.Typed.t option =
+    match
+      List.filter_map terms ~f:(function
+        | Intercept e -> Some e
+        | Slope _ -> None)
+    with
+    | [] -> Some Expr.Helpers.zero
+    | [e] -> Some e
+    | _ -> None
+  in
+  (* The LUB memory pattern of everything feeding the call. *)
+  let rec collect_mems (e : Expr.Typed.t) : Mem_pattern.t list =
+    let direct =
+      match e.pattern with
+      | FunApp (StanLib (_, _, mem), _) -> [mem]
+      | _ -> []
+    in
+    let children =
+      match e.pattern with
+      | FunApp (_, l) -> List.concat_map l ~f:collect_mems
+      | TernaryIf (a, b, c) ->
+          collect_mems a @ collect_mems b @ collect_mems c
+      | EAnd (a, b) | EOr (a, b) -> collect_mems a @ collect_mems b
+      | Indexed (a, idxs) ->
+          collect_mems a
+          @ List.concat_map idxs ~f:(function
+               | Index.Single e' -> collect_mems e'
+               | Upfrom e' -> collect_mems e'
+               | Between (e1, e2) -> collect_mems e1 @ collect_mems e2
+               | MultiIndex e' -> collect_mems e'
+               | All -> [])
+      | Promotion (a, _, _) -> collect_mems a
+      | _ -> []
+    in
+    direct @ children
+  in
+  let rv_ok (e : Expr.Typed.t) =
+    (match (e.pattern, e.meta) with
+    | Var _, {type_= UVector; adlevel= DataOnly; _} -> true
+    | _ -> false)
+  in
+  let scalar_ok (e : Expr.Typed.t) =
+    (match e.meta with {type_= UReal; _} -> true | _ -> false)
+  in
+  let vector_mu_ok (e : Expr.Typed.t) =
+    (match e.meta with {type_= UVector; _} -> true | _ -> false)
+  in
+  let rewrite p =
+    match p with
+    | Stmt.Pattern.TargetPE
+        ( { Expr.pattern=
+              FunApp
+                ( StanLib (name, (FnLpdf _ as suffix), call_mem)
+                , [ ({pattern= Var _; _} as rv); mu; sigma] )
+          ; _ } as e )
+      when String.equal name "normal_lpdf" && rv_ok rv && scalar_ok sigma
+           && vector_mu_ok mu
+      -> (
+        let lub =
+          Mem_pattern.lub_mem_pat (collect_mems mu @ [call_mem])
+        in
+        let glm_call x alpha beta =
+          Expr.
+            { e with
+              pattern=
+                FunApp
+                  (StanLib ("normal_id_glm_lpdf", suffix, lub)
+                  ,[rv; x; alpha; beta; sigma]) }
+        in
+        (* shape 1: matrix predictor (the stock --O1 forms) *)
+        let matrix =
+          match mu.pattern with
+          | FunApp
+              ( StanLib ("Plus__", FnPlain, _)
+              , [ alpha
+                ; { pattern=
+                        FunApp (StanLib ("Times__", FnPlain, _), [x; beta])
+                    ; _ } ] )
+            when is_scalar alpha && matrix_x_ok x && vector_ok beta ->
+                Some (glm_call x alpha beta)
+          | FunApp
+              ( StanLib ("Plus__", FnPlain, _)
+              , [ { pattern=
+                        FunApp (StanLib ("Times__", FnPlain, _), [x; beta])
+                    ; _ }
+                ; alpha ] )
+            when is_scalar alpha && matrix_x_ok x && vector_ok beta ->
+                Some (glm_call x alpha beta)
+          | FunApp (StanLib ("Times__", FnPlain, _), [x; beta])
+            when matrix_x_ok x && vector_ok beta ->
+                Some (glm_call x Expr.Helpers.zero beta)
+          | _ -> None
+        in
+        match matrix with
+        | Some e' -> Stmt.Pattern.TargetPE e'
+        | None -> (
+            (* shape 2: data-vector predictor chain *)
+            match flatten mu [] with
+            | Some terms -> (
+                match (design_and_weights terms, alpha_of terms) with
+                | Some (x, beta), Some alpha ->
+                    Stmt.Pattern.TargetPE (glm_call x alpha beta)
+                | _ -> p)
+            | None -> p))
+    | _ -> p
+  in
+  { mir with
+    reverse_mode_log_prob=
+      List.map mir.reverse_mode_log_prob ~f:(map_rec_stmt_loc rewrite) }
 let collapse_lists_statement _ =
   let rec collapse_lists l =
     match l with
@@ -1363,7 +1633,8 @@ type optimization_settings =
   ; lazy_code_motion: bool
   ; optimize_ad_levels: bool
   ; preserve_stability: bool
-  ; optimize_soa: bool }
+  ; optimize_soa: bool
+  ; emit_normal_glm: bool }
 
 let settings_const b =
   { function_inlining= b
@@ -1381,7 +1652,8 @@ let settings_const b =
   ; lazy_code_motion= b
   ; optimize_ad_levels= b
   ; preserve_stability= not b
-  ; optimize_soa= b }
+  ; optimize_soa= b
+  ; emit_normal_glm= b }
 
 let all_optimizations : optimization_settings = settings_const true
 let no_optimizations : optimization_settings = settings_const false
@@ -1390,7 +1662,13 @@ type optimization_level = O0 | O1 | Oexperimental
 
 let level_optimizations (lvl : optimization_level) : optimization_settings =
   match lvl with
-  | O0 -> no_optimizations
+  | O0 ->
+      { no_optimizations with
+        (* W-128: the glm emission is the one pass that runs at the default
+           level. STATISTICAL (disclosed in the pass docstring): the glm
+           interior changes FP association and computes analytic gradients;
+           upstream would gate this behind --Oexperimental. *)
+        emit_normal_glm= true }
   | O1 ->
       { function_inlining= true
       ; static_loop_unrolling= false
@@ -1407,7 +1685,8 @@ let level_optimizations (lvl : optimization_level) : optimization_settings =
       ; allow_uninitialized_decls= true
       ; optimize_ad_levels= false
       ; preserve_stability= false
-      ; optimize_soa= true }
+      ; optimize_soa= true
+      ; emit_normal_glm= true }
   | Oexperimental -> all_optimizations
 
 let optimization_suite ?(settings = all_optimizations) mir =
@@ -1458,7 +1737,11 @@ let optimization_suite ?(settings = all_optimizations) mir =
     ; (allow_uninitialized_decls, settings.allow_uninitialized_decls)
       (* Book: Machine idioms and instruction combining *)
       (* Matthijs: Everything < block_fixing *)
-    ; (block_fixing, settings.block_fixing) ] in
+    ; (block_fixing, settings.block_fixing)
+      (* W-128: LAST - the glm emission must see the fully-optimized shapes
+         (incl. the --O1 fma spelling of the predictor chains), and nothing
+         may rewrite the produced [normal_id_glm_lpdf] call. *)
+    ; (emit_normal_glm, settings.emit_normal_glm) ] in
   let optimizations =
     List.filter_map maybe_optimizations ~f:(fun (fn, flag) ->
         if flag then Some fn else None) in
