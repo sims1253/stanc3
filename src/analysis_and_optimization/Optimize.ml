@@ -951,10 +951,10 @@ let dot_self_gathered_diff_expr (ctx : gathered_ctx) (e : Expr.Typed.t) :
          | {type_= UReal; adlevel= AutoDiffable; _} -> true
          | _ -> false)
          && (match a.meta with {type_= UVector; _} -> true | _ -> false)
-         && (match b.meta with {type_= UVector; _} -> true | _ -> false)
-         && String.equal (var_name a) (var_name b) -> (
+         && (match b.meta with {type_= UVector; _} -> true | _ -> false) -> (
       match (gathered_leaf ctx a, gathered_leaf ctx b) with
-      | Some (g1, _, i1), Some (_, _, i2) ->
+      | Some (g1, _, i1), Some (g2, _, i2)
+        when String.equal (var_name g1) (var_name g2) ->
           Expr.
             { e with
               pattern=
