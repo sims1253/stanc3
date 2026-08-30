@@ -11,7 +11,7 @@
 
 open Std
 
-type emission = SingleVar | PerObservation
+type emission = SingleVar | PerObservation | TpLoop
 
 type t = {
   primitive : string  (** [StanLib] name of the emitted call *)
@@ -39,7 +39,15 @@ let families =
     ; doc=
         "loop-form normal likelihood for (n in 1:N) { mu[n] = alpha[ii[n]] \
          [+ x[n] * beta[ii2[n]]]; target += normal_lpdf(y[n] | mu[n], sigma) \
-         } (W-112)" } ]
+         } (W-112)" }
+  ; { primitive= "gathered_additive_tp"
+    ; header= "stan/math/rev/prob/bernoulli_logit_lpmf_gathered.hpp"
+    ; emission= TpLoop
+    ; doc=
+        "tp-built gathered-additive predictor for (i in 1:N) { y_hat[i] = \
+         beta[1] + beta[2]*xd[i] ... + a[idx[i]] } with y_hat's only other use \
+         a downstream likelihood — the loop becomes the per-element custom-vari \
+         factory call, the likelihood stays stock (W-131)" } ]
 
 let primitives = List.map families ~f:(fun f -> f.primitive)
 

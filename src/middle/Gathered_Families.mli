@@ -12,8 +12,13 @@
     - [PerObservation] returns one var per observation, which the generated
       model must push into the accumulator one by one to keep stock's
       chunked accumulation schedule bit-identical (the loop-class family,
-      W-112 §2). *)
-type emission = SingleVar | PerObservation
+      W-112 §2);
+    - [TpLoop] is not a likelihood at all: it is the transformed-parameters
+      LOOP rewrite (W-131) — the matched [for] loop over the predictor
+      becomes a whole-vector assignment of the factory call's result, and
+      the backend emits that assignment as a plain [y_hat = call;] (the
+      gated hand-edit's exact shape) instead of [stan::model::assign]. *)
+type emission = SingleVar | PerObservation | TpLoop
 
 type t = {
   primitive : string  (** [StanLib] name of the emitted call *)

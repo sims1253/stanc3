@@ -236,6 +236,19 @@ let rec lower_statement Stmt.{pattern; meta} : stmt list =
       , (( {meta= {Expr.Typed.Meta.type_= UInt | UReal | UComplex; _}; _}
          | { pattern= FunApp (CompilerInternal (FnReadData | FnReadParam _), _)
            ; _ } ) as rhs) ) ->
+    Assign (lower_nonrange_lbase lhs, lower_expr rhs) |> wrap_e
+  | Assignment
+      ( (((LVariable _ | LTupleProjection _) as lhs), [])
+      , _
+      , ({pattern= FunApp (StanLib (name, _, _), _); _} as rhs) )
+    when Gathered_Families.emission_of name
+         = Some Gathered_Families.TpLoop ->
+      (* The tp-loop factory (W-131): the transformed-parameters loop was
+         rewritten to the gathered_additive_tp call, whose result is a
+         freshly-sized whole vector assigned to a fresh predictor — emit
+         the plain whole-vector assignment (the gated hand-edit's exact
+         shape), not stan::model::assign (no resize/deep-copy semantics
+         are needed or wanted here). *)
       Assign (lower_nonrange_lbase lhs, lower_expr rhs) |> wrap_e
   | Assignment ((LVariable assignee, idcs), (UInt | UReal | UComplex), rhs)
     when List.for_all ~f:is_single_index idcs ->
