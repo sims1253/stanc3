@@ -11,7 +11,15 @@
 
 open Std
 
-type emission = SingleVar | PerObservation
+type emission =
+  | SingleVar
+  | PerObservation of string * string
+      (** [(decl-type spelling, term-variable prefix)]: how the per-observation
+          terms vector is declared and named in the generated model. The
+          spellings are the gated hand-edits' verbatim choices — ["lp"] with
+          the explicit [std::vector] type (W-112), ["pcm"] with [auto]
+          (W-126) — kept per family so each emitted block is token-identical
+          to its certified reference. *)
 
 type t = {
   primitive : string  (** [StanLib] name of the emitted call *)
@@ -35,11 +43,21 @@ let families =
          (W-113)" }
   ; { primitive= "normal_lpdf_gathered"
     ; header= "stan/math/rev/prob/normal_lpdf_gathered.hpp"
-    ; emission= PerObservation
+    ; emission=
+        PerObservation
+          ("const std::vector<stan::math::var>", "lp")
     ; doc=
         "loop-form normal likelihood for (n in 1:N) { mu[n] = alpha[ii[n]] \
          [+ x[n] * beta[ii2[n]]]; target += normal_lpdf(y[n] | mu[n], sigma) \
-         } (W-112)" } ]
+         } (W-112)" }
+  ; { primitive= "pcm_lpdf_gathered"
+    ; header= "stan/math/rev/prob/pcm_lpdf_gathered.hpp"
+    ; emission= PerObservation ("auto", "pcm")
+    ; doc=
+        "loop-form partial-credit likelihood composed through the user \
+         function softmax(cumulative_sum(append_row(0, theta[jj] .* \
+         alpha[ii] - segment(beta, pos[ii], m[ii])))) + categorical_lpmf \
+         (W-126/W-132)" } ]
 
 let primitives = List.map families ~f:(fun f -> f.primitive)
 

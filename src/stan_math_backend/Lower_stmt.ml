@@ -275,26 +275,41 @@ let rec lower_statement Stmt.{pattern; meta} : stmt list =
       |> wrap_e
   | TargetPE e -> (
       let accum = Var "lp_accum__" in
+      let per_observation name =
+        match Gathered_Families.emission_of name with
+        | Some (Gathered_Families.PerObservation (ty, pfx)) ->
+            (* The loop-class gathered primitives (W-112) return ONE VAR PER
+               OBSERVATION, not a single var: the rev-mode [accumulator<var>]
+               partial specialization keeps a 128-element chunk-collapse
+               buffer, so the model must push each term into [lp_accum__]
+               separately, in n order, to keep the stock loop's accumulation
+               schedule (and therefore the lp value) bit-identical. Each
+               family declares and names its terms vector exactly as its
+               gated hand-edit did (W-112/W-115: [lp_terms__] with the
+               explicit vector type; W-126/W-132: [pcm_terms__] with
+               [auto]). *)
+            Some
+              [ Block
+                  [ VariableDefn
+                      (make_variable_defn
+                         ~type_:(TypeLiteral ty)
+                         ~name:(pfx ^ "_terms__")
+                         ~init:(Assignment (lower_expr e)) ())
+                  ; ForEach
+                      ( (Const (Ref Auto), pfx ^ "_term__")
+                      , Var (pfx ^ "_terms__")
+                      , Expression
+                          (accum.@?("add", [Var (pfx ^ "_term__")])) ) ] ]
+        | _ -> None in
       match e.pattern with
       | FunApp (StanLib (name, _, _), _)
-        when Gathered_Families.emission_of name
-             = Some Gathered_Families.PerObservation ->
-          (* The loop-class gathered primitives (W-112) return ONE VAR PER
-             OBSERVATION, not a single var: the rev-mode [accumulator<var>]
-             partial specialization keeps a 128-element chunk-collapse
-             buffer, so the model must push each term into [lp_accum__]
-             separately, in n order, to keep the stock loop's accumulation
-             schedule (and therefore the lp value) bit-identical. *)
-          [ Block
-              [ VariableDefn
-                  (make_variable_defn
-                     ~type_:(Const (TypeLiteral "std::vector<stan::math::var>"))
-                     ~name:"lp_terms__"
-                     ~init:(Assignment (lower_expr e)) ())
-              ; ForEach
-                  ( (Const (Ref Auto), "lp_term__")
-                  , Var "lp_terms__"
-                  , Expression (accum.@?("add", [Var "lp_term__"])) ) ] ]
+        when
+          (match Gathered_Families.emission_of name with
+          | Some (Gathered_Families.PerObservation _) -> true
+          | _ -> false) -> (
+          match per_observation name with
+          | Some stmts -> stmts
+          | None -> accum.@?("add", [lower_expr e]) |> wrap_e)
       | _ -> accum.@?("add", [lower_expr e]) |> wrap_e)
   | JacobianPE e ->
       let accum = Var "lp_accum__" in

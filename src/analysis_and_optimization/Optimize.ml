@@ -815,14 +815,21 @@ let vectorize_loops (mir : Program.Typed.t) =
 
 (* Context every matcher works against: the program's data variables, for
    the index-vector admissibility checks (an index vector must be data so
-   the primitive can read it as ints at runtime). *)
-type gathered_ctx = {data_vars: String.Set.t}
+   the primitive can read it as ints at runtime), and the data variables'
+   SIZED types (the loop-class matchers must verify the loop bound is the
+   declared length of every data vector the primitive consumes whole). *)
+type gathered_ctx =
+  { data_vars: String.Set.t
+  ; input_sizes: Expr.Typed.t SizedType.t String.Map.t }
 
 let gathered_ctx_of (mir : Program.Typed.t) =
   let data_vars =
     List.map mir.input_vars ~f:(fun (name, _, _) -> name)
     |> String.Set.of_list in
-  {data_vars}
+  let input_sizes =
+    List.map mir.input_vars ~f:(fun (name, _, ty) -> (name, ty))
+    |> String.Map.of_list in
+  {data_vars; input_sizes}
 
 (* A gathered coefficient leaf: vector_var [ MultiIndex (data int vector
    var) ]. Returns the bare container var expression, the index variable's
@@ -1353,6 +1360,371 @@ let normal_loops_rewrite (ctx : gathered_ctx) (prog : Stmt.Located.t list) :
     | None -> List.map ~f:rewrite_stmt l in
   rewrite_list prog
 
+(* ------------------------------------------------------------------ *)
+(* Entry 4 — the composed USER-FUNCTION pcm likelihood (W-126/W-132),  *)
+(* the through-the-inlined-function matcher class.                      *)
+(* ------------------------------------------------------------------ *)
+
+(* The gpcm/ordered-Irt likelihood is not a library density: the model
+   defines
+
+     real pcm(int y, real theta, vector beta) {
+       vector[rows(beta) + 1] unsummed;
+       vector[rows(beta) + 1] probs;
+       unsummed = append_row(rep_vector(0.0, 1), theta - beta);
+       probs = softmax(cumulative_sum(unsummed));
+       return categorical_lpmf(y + 1 | probs);
+     }
+
+   and calls it per observation:
+
+     for (n in 1:N)
+       target += pcm(y[n], theta[jj[n]] .* alpha[ii[n]],
+                     segment(beta, pos[ii[n]], m[ii[n]]));
+
+   At --O1 [function_inlining] — the FIRST pass of the suite — expands the
+   call, so by the time [gathered_families] (the LAST pass) runs, the loop
+   body is the inlined body with the call-site arguments substituted:
+
+     { Decl ret;
+       { FnValidateSize; Decl unsummed; FnValidateSize; Decl probs;
+         unsummed = append_row(rep_vector(0, 1),
+                               Minus__(theta[jj[n]] * alpha[ii[n]],
+                                       segment(beta, pos[ii[n]], m[ii[n]])));
+         probs = softmax(cumulative_sum(unsummed));
+         ret = categorical_lpmf(y[n] + 1 | probs); }
+       target += ret; }
+
+   Matching THROUGH the user function is therefore a matter of matching this
+   stereotyped inlined statement sequence (the W-131 lesson: the pattern is
+   EASIER post-inlining — the body is fully visible and the fresh
+   [inline_pcm_*] locals cannot be mentioned outside the loop). The paired
+   primitive
+
+     pcm_lpdf_gathered<propto>(y, theta, jj, alpha, ii, beta, pos, m)
+
+   (W-126, math#23) consumes the index vectors and the item tables instead
+   of the per-observation expressions and is bit-identical to the composed
+   stock path while deleting its whole per-observation expression complex
+   (-88.3% Ir on the gate model). It returns one var per observation (the
+   W-112 accumulator contract). *)
+
+(* A gathered SCALAR read through the loop variable: coef[idx[n]] — the
+   container an AutoDiffable vector, the index a data int array read at
+   [n]. Returns (container, index container, index name). *)
+let pcm_scalar_gather (ctx : gathered_ctx) n (e : Expr.Typed.t) :
+    (Expr.Typed.t * Expr.Typed.t * string) option =
+  match e.pattern with
+  | Indexed
+      ( ( { pattern= Var _
+          ; meta= {type_= UVector; adlevel= AutoDiffable; _}
+          ; _ } as container )
+      , [ Index.Single
+            { Expr.pattern=
+                Indexed
+                  ( ( { pattern= Var idx
+                      ; meta= {type_= UArray UInt; adlevel= DataOnly; _}
+                      ; _ } as index )
+                  , [Index.Single {pattern= Var nv; _}] )
+            ; _ } ] )
+    when String.equal nv n && String.Set.mem idx ctx.data_vars ->
+      Some (container, index, idx)
+  | _ -> None
+
+(* The gathered bilinear theta[jj[n]] .* alpha[ii[n]] — both spellings of
+   the scalar product ([.* ] eltwise and [*] plain) decompose to the same
+   two gathered scalars; returns them in the expression's own order. *)
+let pcm_bilinear (ctx : gathered_ctx) n (e : Expr.Typed.t) :
+    (Expr.Typed.t * Expr.Typed.t * string * Expr.Typed.t * Expr.Typed.t * string)
+    option =
+  match e.pattern with
+  | FunApp
+      ( StanLib (("EltTimes__" | "Times__"), FnPlain, _)
+      , [a; b] )
+    when (match e.meta with
+          | {type_= UReal; adlevel= AutoDiffable; _} -> true
+          | _ -> false) -> (
+      match (pcm_scalar_gather ctx n a, pcm_scalar_gather ctx n b) with
+      | Some (t, tj, tix), Some (a', aj, aix) ->
+          Some (t, tj, tix, a', aj, aix)
+      | _ -> None)
+  | _ -> None
+
+(* An item-table read through the observation's item index: tbl[ii[n]] —
+   the table a data int array, the index the SAME [ii] the bilinear's
+   alpha operand is gathered through. *)
+let pcm_item_table (_ctx : gathered_ctx) n ii (e : Expr.Typed.t) :
+    Expr.Typed.t option =
+  match e.pattern with
+  | Indexed
+      ( ( { pattern= Var _
+          ; meta= {type_= UArray UInt; adlevel= DataOnly; _}
+          ; _ } as container )
+      , [ Index.Single
+            { Expr.pattern=
+                Indexed
+                  ( { pattern= Var idx
+                    ; meta= {type_= UArray UInt; adlevel= DataOnly; _}
+                    ; _ }
+                  , [Index.Single {pattern= Var nv; _}] )
+            ; _ } ] )
+    when String.equal nv n && String.equal idx ii ->
+      Some container
+  | _ -> None
+
+(* segment(beta, pos[ii[n]], m[ii[n]]) — the concatenated-steps window for
+   the observation's item. *)
+let pcm_segment (ctx : gathered_ctx) n ii (e : Expr.Typed.t) :
+    (Expr.Typed.t * Expr.Typed.t * Expr.Typed.t) option =
+  match e.pattern with
+  | FunApp
+      ( StanLib ("segment", FnPlain, _)
+      , [ ( { pattern= Var _
+            ; meta= {type_= UVector; adlevel= AutoDiffable; _}
+            ; _ } as beta )
+        ; start
+        ; len ] ) -> (
+      match (pcm_item_table ctx n ii start, pcm_item_table ctx n ii len) with
+      | Some pos, Some m -> Some (beta, pos, m)
+      | _ -> None)
+  | _ -> None
+
+let pcm_zero_literal (e : Expr.Typed.t) : bool =
+  match e.pattern with
+  | Lit (Real, "0.0") | Lit (Int, "0") -> true
+  | Promotion ({pattern= Lit (Int, "0"); _}, _, _) -> true
+  | _ -> false
+
+type pcm_loop =
+  { pl_bound: string  (* the loop upper bound (a data variable) *)
+  ; pl_y: Expr.Typed.t  (* the data response container *)
+  ; pl_theta: Expr.Typed.t
+  ; pl_jj: Expr.Typed.t
+  ; pl_alpha: Expr.Typed.t
+  ; pl_ii: Expr.Typed.t
+  ; pl_beta: Expr.Typed.t
+  ; pl_pos: Expr.Typed.t
+  ; pl_m: Expr.Typed.t
+  ; pl_tpe: Expr.Typed.t  (* the matched categorical_lpmf expr *)
+  ; pl_mem: Mem_pattern.t
+  ; pl_metas: Stmt.Located.Meta.t list  (* interior statements, post-order *)
+  }
+
+(* Match the [for] statement itself. The whole-program side conditions
+   (loop bound = the declared length of [y]/[jj]/[ii]; [y] never written)
+   are checked by the caller, which sees the whole reverse-mode log prob
+   and the program's data block. *)
+let match_pcm_loop (ctx : gathered_ctx)
+    (pat : (Expr.Typed.t, Stmt.Located.t) Stmt.Pattern.t) : pcm_loop option =
+  match pat with
+  | For
+      { loopvar= n
+      ; lower= {Expr.pattern= Lit (Int, "1"); _}
+      ; upper= {Expr.pattern= Var bound; meta= {type_= UInt; adlevel= DataOnly; _}; _}
+      ; body=
+          ( { pattern=
+                Block
+                  [ ( { pattern= Decl {decl_id= ret; _}
+                      ; meta= m_ret } )
+                  ; ( { pattern=
+                          Block
+                            [ ( { pattern=
+                                  NRFunApp (CompilerInternal FnValidateSize, _)
+                                ; meta= m_val1 } )
+                            ; ({pattern= Decl {decl_id= u; _}; meta= m_decl_u})
+                            ; ( { pattern=
+                                  NRFunApp (CompilerInternal FnValidateSize, _)
+                                ; meta= m_val2 } )
+                            ; ({pattern= Decl {decl_id= p; _}; meta= m_decl_p})
+                            ; ( { pattern=
+                                    Assignment
+                                      ((LVariable ua, []), _, rhs_u)
+                                ; meta= m_asn_u } )
+                            ; ( { pattern=
+                                    Assignment ((LVariable pa, []), _, rhs_p)
+                                ; meta= m_asn_p } )
+                            ; ( { pattern=
+                                    Assignment ((LVariable ra, []), _, rhs_l)
+                                ; meta= m_asn_r } ) ]
+                      ; meta= m_inner } as inner )
+                  ; ( { pattern= TargetPE {Expr.pattern= Var rt; _}
+                      ; meta= m_tpe } ) ]
+            ; meta= m_body } ) }
+    when String.equal ua u && String.equal pa p && String.equal ra ret
+         && String.equal rt ret
+         && String.Set.mem bound ctx.data_vars -> (
+      (* probs = softmax(cumulative_sum(unsummed)) *)
+      let probs_ok =
+        match rhs_p.pattern with
+        | FunApp
+            ( StanLib ("softmax", FnPlain, _)
+            , [ { Expr.pattern=
+                    FunApp
+                      (StanLib ("cumulative_sum", FnPlain, _), [pu])
+                ; _ } ] )
+          when (match rhs_p.meta with
+                | {type_= UVector; adlevel= AutoDiffable; _} -> true
+                | _ -> false) -> (
+            match pu.Expr.pattern with
+            | Var pu' -> String.equal pu' u
+            | _ -> false)
+        | _ -> false in
+      (* ret = categorical_lpmf(y[n] + 1 | probs) *)
+      let lpmf_parts =
+        match rhs_l.pattern with
+        | FunApp
+            ( StanLib ("categorical_lpmf", (FnLpmf _ as suffix), mem)
+            , [ { Expr.pattern=
+                    FunApp
+                      (StanLib ("Plus__", FnPlain, _), [y_n; {pattern= Lit (Int, "1"); _}])
+                ; _ }
+              ; {pattern= Var lp; _} ] ) -> (
+            match y_n.Expr.pattern with
+            | Indexed
+                ( ( { pattern= Var _
+                    ; meta= {type_= UArray UInt; adlevel= DataOnly; _}
+                    ; _ } as yv )
+                , [Index.Single {pattern= Var ny; _}] )
+              when String.equal ny n && String.Set.mem (var_name yv) ctx.data_vars
+                   && String.equal lp p ->
+                Some (yv, suffix, mem)
+            | _ -> None)
+        | _ -> None in
+      (* unsummed = append_row(rep_vector(0, 1), bilinear - segment) *)
+      let unsummed_parts =
+        match rhs_u.pattern with
+        | FunApp
+            ( StanLib ("append_row", FnPlain, _)
+            , [ { Expr.pattern=
+                    FunApp
+                      ( StanLib ("rep_vector", FnPlain, _)
+                      , [z; {pattern= Lit (Int, "1"); _}] )
+                ; _ }
+              ; { Expr.pattern=
+                    FunApp (StanLib ("Minus__", FnPlain, _), [bil; seg])
+                ; _ } ] )
+          when pcm_zero_literal z
+               && (match rhs_u.meta with
+                   | {type_= UVector; adlevel= AutoDiffable; _} -> true
+                   | _ -> false) -> (
+            match pcm_bilinear ctx n bil with
+            | Some (t, tj, tix, a, aj, aix) -> (
+                (* the segment's item index must be the alpha gather's (the
+                   item table is per-item; either bilinear operand order is
+                   bitwise-commutative, so try both as "alpha") *)
+                let try_ix ix alpha a_ix_container =
+                  match pcm_segment ctx n ix seg with
+                  | Some (beta, pos, m) -> Some (t, tj, alpha, a_ix_container, beta, pos, m)
+                  | None -> None in
+                match try_ix aix a aj with
+                | Some parts -> Some parts
+                | None -> try_ix tix t tj)
+            | None -> None)
+        | _ -> None in
+      match (probs_ok, lpmf_parts, unsummed_parts) with
+      | true, Some (yv, suffix, mem), Some (theta, jj, alpha, ii, beta, pos, m)
+        when suffix = FnLpmf false || suffix = FnLpmf true -> (
+          ignore inner;
+          Some
+            { pl_bound= bound
+            ; pl_y= yv
+            ; pl_theta= theta
+            ; pl_jj= jj
+            ; pl_alpha= alpha
+            ; pl_ii= ii
+            ; pl_beta= beta
+            ; pl_pos= pos
+            ; pl_m= m
+            ; pl_tpe= rhs_l
+            ; pl_mem= mem
+            ; pl_metas=
+                [ m_ret; m_val1; m_decl_u; m_val2; m_decl_p; m_asn_u
+                ; m_asn_p; m_asn_r; m_inner; m_tpe; m_body ] })
+      | _ -> None)
+  | _ -> None
+
+(* Rewrite one matched loop into the primitive's [target +=] call: the
+   [for] becomes an [SList] of no-op [Skip]s carrying every interior
+   statement location (in the numbering pass's post-order, so the whole
+   [locations_array__] stays EXACTLY what the un-rewritten program prints)
+   plus the call carrying the [for]'s own location — the entry-3
+   convention. The primitive's [<propto__>] template argument is inert
+   (the pcm interior has no constant terms, W-126 header doc), matching
+   the gated hand-edit's spelling. *)
+let rewrite_pcm_loop (m : pcm_loop) (for_stmt : Stmt.Located.t) :
+    Stmt.Located.t =
+  let call =
+    Expr.
+      { m.pl_tpe with
+        pattern=
+          FunApp
+            ( StanLib ("pcm_lpdf_gathered", FnLpmf true, m.pl_mem)
+            , [ m.pl_y; m.pl_theta; m.pl_jj; m.pl_alpha; m.pl_ii
+              ; m.pl_beta; m.pl_pos; m.pl_m ] ) } in
+  { for_stmt with
+    pattern=
+      Stmt.Pattern.SList
+        ( List.map m.pl_metas
+            ~f:(fun meta ->
+              ({pattern= Stmt.Pattern.Skip; meta} : Stmt.Located.t))
+        @ [ {pattern= Stmt.Pattern.TargetPE call; meta= for_stmt.meta} ] ) }
+
+(* One entry's statement-list rewriter: match the loops, check the
+   whole-program side conditions, replace the [for] with the call.
+
+   Side conditions, all of which must hold or nothing fires: the loop
+   bound is a bare data variable that is ALSO the declared length of
+   [y], [jj] and [ii] (the primitive consumes all four whole, so the
+   stock loop must have processed exactly the containers' full extent);
+   [y] is never written anywhere in the reverse-mode log prob. The
+   loop-local [inline_pcm_*] variables are gensym-fresh and declared
+   inside the loop, so they cannot be mentioned elsewhere. *)
+let pcm_loops_rewrite (ctx : gathered_ctx) (prog : Stmt.Located.t list) :
+    Stmt.Located.t list =
+  let written = written_vars_of_stmts prog in
+  let sized_array_of_bound bound name =
+    match String.Map.find_opt name ctx.input_sizes with
+    | Some (SizedType.SArray (SInt, {Expr.pattern= Var sz; _})) ->
+        String.equal sz bound
+    | _ -> false in
+  let side_ok (m : pcm_loop) =
+    (not (List.exists written ~f:(fun v -> String.equal v (var_name m.pl_y))))
+    && sized_array_of_bound m.pl_bound (var_name m.pl_y)
+    && sized_array_of_bound m.pl_bound (var_name m.pl_jj)
+    && sized_array_of_bound m.pl_bound (var_name m.pl_ii) in
+  let fire (l : Stmt.Located.t list) : Stmt.Located.t list option =
+    let fired = ref false in
+    let l' =
+      List.map l ~f:(fun (s : Stmt.Located.t) ->
+          if !fired then s
+          else
+            match match_pcm_loop ctx s.pattern with
+            | Some m when side_ok m ->
+                fired := true;
+                rewrite_pcm_loop m s
+            | _ -> s) in
+    if !fired then Some l' else None in
+  let rec rewrite_stmt (s : Stmt.Located.t) : Stmt.Located.t =
+    match s.pattern with
+    | Block l -> {s with pattern= Block (rewrite_list l)}
+    | SList l -> {s with pattern= SList (rewrite_list l)}
+    | For f ->
+        let body' = rewrite_stmt f.body in
+        {s with pattern= For {f with body= body'}}
+    | IfElse (c, t, e) ->
+        let e' = Option.map ~f:rewrite_stmt e in
+        {s with pattern= IfElse (c, rewrite_stmt t, e')}
+    | While (c, b) -> {s with pattern= While (c, rewrite_stmt b)}
+    | Profile (nm, ls) ->
+        {s with pattern= Profile (nm, List.map ~f:rewrite_stmt ls)}
+    | _ -> s
+  and rewrite_list l =
+    match fire l with
+    | Some l' -> rewrite_list l'
+    | None -> List.map ~f:rewrite_stmt l
+  in
+  rewrite_list prog
+
 (* The registry: one row per landed family, in emission order. Each rewrite
    sees the statement list of [reverse_mode_log_prob] only. *)
 let gathered_registry :
@@ -1364,7 +1736,8 @@ let gathered_registry :
     )
   ; ( "dot_self_gathered_diff"
     , fun ctx stmts -> List.map stmts ~f:(dot_self_rewrite_stmt ctx) )
-  ; ("normal_lpdf_gathered", normal_loops_rewrite) ]
+  ; ("normal_lpdf_gathered", normal_loops_rewrite)
+  ; ("pcm_lpdf_gathered", pcm_loops_rewrite) ]
 
 (* The suite pass: apply every registered family to the reverse-mode log
    prob. *)

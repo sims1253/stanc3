@@ -9,11 +9,13 @@
 (** How the primitive's result reaches [lp_accum__]:
     - [SingleVar] returns one var holding the whole log density (the
       expression-class families);
-    - [PerObservation] returns one var per observation, which the generated
-      model must push into the accumulator one by one to keep stock's
-      chunked accumulation schedule bit-identical (the loop-class family,
-      W-112 §2). *)
-type emission = SingleVar | PerObservation
+    - [PerObservation (decl-type, prefix)] returns one var per observation,
+      which the generated model must push into the accumulator one by one to
+      keep stock's chunked accumulation schedule bit-identical (the loop-class
+      family, W-112 §2); the pair is the C++ declaration spelling and variable
+      prefix of the terms vector, each family's gated hand-edit's verbatim
+      choice. *)
+type emission = SingleVar | PerObservation of string * string
 
 type t = {
   primitive : string  (** [StanLib] name of the emitted call *)
