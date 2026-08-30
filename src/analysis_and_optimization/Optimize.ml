@@ -1609,16 +1609,21 @@ let match_pcm_loop (ctx : gathered_ctx)
                    | _ -> false) -> (
             match pcm_bilinear ctx n bil with
             | Some (t, tj, tix, a, aj, aix) -> (
-                (* the segment's item index must be the alpha gather's (the
-                   item table is per-item; either bilinear operand order is
-                   bitwise-commutative, so try both as "alpha") *)
-                let try_ix ix alpha a_ix_container =
-                  match pcm_segment ctx n ix seg with
-                  | Some (beta, pos, m) -> Some (t, tj, alpha, a_ix_container, beta, pos, m)
-                  | None -> None in
-                match try_ix aix a aj with
-                | Some parts -> Some parts
-                | None -> try_ix tix t tj)
+                (* The segment's item index picks out which bilinear operand
+                   is the ITEM side (alpha): it must be gathered through the
+                   same index the segment windows the item tables with. The
+                   other operand is then the person side (theta) — either
+                   source spelling (theta[jj] .* alpha[ii] or commuted)
+                   decomposes to the primitive's (theta, jj, alpha, ii) with
+                   BOTH bindings swapped together, never a mix (the operand
+                   mix-up would silently drop a container — the W-115 §6
+                   lesson). *)
+                match pcm_segment ctx n aix seg with
+                | Some (beta, pos, m) -> Some (t, tj, a, aj, beta, pos, m)
+                | None -> (
+                    match pcm_segment ctx n tix seg with
+                    | Some (beta, pos, m) -> Some (a, aj, t, tj, beta, pos, m)
+                    | None -> None))
             | None -> None)
         | _ -> None in
       match (probs_ok, lpmf_parts, unsummed_parts) with
