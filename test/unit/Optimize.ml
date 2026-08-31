@@ -2129,6 +2129,35 @@ let%expect_test "partially evaluate with equality check" =
         if(PNot__(emit_generated_quantities__)) return;
       } |}]
 
+(* unsound rewrite removed: see Partial_evaluator.ml history; inv_logit is
+   elementwise, categorical_logit softmax-normalizes *)
+let%expect_test "partially evaluate categorical_lpmf with inv_logit" =
+  let mir =
+    reset_and_mir_of_string
+      {|
+      model {
+        vector[2] alpha = [1, -1]';
+        print(categorical_lpmf(1 | inv_logit(alpha)));
+      }
+      |}
+  in
+  let mir = partial_evaluation mir in
+  Fmt.str "@[<v>%a@]" Program.Typed.pp mir |> print_endline;
+  [%expect
+    {|
+      log_prob {
+        {
+          vector[2] alpha = [1, -1]';
+          FnPrint__(categorical_lpmf(1, inv_logit(alpha)));
+        }
+      }
+
+
+      generate_quantities {
+        if(PNot__(emit_transformed_parameters__ || emit_generated_quantities__)) return;
+        if(PNot__(emit_generated_quantities__)) return;
+      } |}]
+
 let%expect_test "partially evaluate functions" =
   let mir =
     reset_and_mir_of_string
@@ -2363,8 +2392,8 @@ model {
           target += bernoulli_logit_lupmf(y_arr, x_vector);
           target += binomial_logit_lpmf(y_arr, 32, x_vector);
           target += binomial_logit_lupmf(y_arr, 32, x_vector);
-          target += categorical_logit_lpmf(y_arr, x_vector);
-          target += categorical_logit_lupmf(y_arr, x_vector);
+          target += categorical_lpmf(y_arr, inv_logit(x_vector));
+          target += categorical_lupmf(y_arr, inv_logit(x_vector));
           target += columns_dot_self(x_matrix);
           target += dot_self(x_vector);
           target += inv_sqrt(x_vector);
