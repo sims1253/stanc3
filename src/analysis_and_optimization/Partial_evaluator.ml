@@ -253,6 +253,23 @@ let rec eval_expr ?(preserve_stability = false) (e : Expr.Typed.t) =
                       ( StanLib
                           ("binomial_logit_lpmf", suffix, lub_mem_pat [mem])
                       , [y; n; alpha] )
+                | ( "categorical_lpmf"
+                  , [ y
+                    ; { pattern=
+                          FunApp (StanLib ("softmax", FnPlain, mem), [alpha])
+                      ; _ } ] ) ->
+                    FunApp
+                      ( StanLib
+                          ("categorical_logit_lpmf", suffix, lub_mem_pat [mem])
+                      , [y; alpha] )
+                | ( "categorical_rng"
+                  , [ { pattern=
+                          FunApp (StanLib ("softmax", FnPlain, mem), [alpha])
+                      ; _ } ] ) ->
+                    FunApp
+                      ( StanLib
+                          ("categorical_logit_rng", suffix, lub_mem_pat [mem])
+                      , [alpha] )
                 | "columns_dot_product", [x; y] when Expr.Typed.equal x y ->
                     FunApp (StanLib ("columns_dot_self", suffix, mem_type), [x])
                 | "dot_product", [x; y] when Expr.Typed.equal x y ->
