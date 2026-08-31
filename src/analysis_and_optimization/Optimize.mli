@@ -23,6 +23,18 @@ val list_collapsing : Program.Typed.t -> Program.Typed.t
 (** Remove redundant SList constructors from the Mir that might have been
     introduced by other optimizations *)
 
+val gathered_families : Program.Typed.t -> Program.Typed.t
+(** The gathered-families registry pass: rewrite every registered gathered
+    Stan shape in the reverse-mode log prob into a call to its paired
+    stan-math primitive, which takes the index vectors instead of the
+    gathered matrices (bit-identical; see [Middle.Gathered_families] for
+    the table). Registered families: the 2PL likelihood
+    [bernoulli_logit_lpmf(y, alpha[ii] .* (theta[jj] - beta[ii]))] (W-108),
+    the gathered ICAR prior [-0.5 * dot_self(phi[node1] - phi[node2])]
+    (W-113), and the loop-form normal likelihood [for (n in 1:N) { mu[n] =
+    alpha[ii[n]] [+ x[n] * beta[ii2[n]]]; target += normal_lpdf(y[n] |
+    mu[n], sigma) }] (W-112). Non-matching code is left unchanged *)
+
 val block_fixing : Program.Typed.t -> Program.Typed.t
 (** Make sure that SList constructors directly under if, for, while or fundef
     constructors are replaced with Block constructors. This should probably be
@@ -85,7 +97,8 @@ type optimization_settings =
   ; lazy_code_motion: bool
   ; optimize_ad_levels: bool
   ; preserve_stability: bool
-  ; optimize_soa: bool }
+  ; optimize_soa: bool
+  ; gathered_families: bool }
 
 val all_optimizations : optimization_settings
 val no_optimizations : optimization_settings
