@@ -273,9 +273,29 @@ let rec lower_statement Stmt.{pattern; meta} : stmt list =
              ("assigning variable " ^ Stmt.Helpers.get_lhs_name lhs) ]
         @ List.map ~f:lower_index lhs_idcs)
       |> wrap_e
-  | TargetPE e ->
+  | TargetPE e -> (
       let accum = Var "lp_accum__" in
-      accum.@?("add", [lower_expr e]) |> wrap_e
+      match e.pattern with
+      | FunApp (StanLib (name, _, _), _)
+        when Gathered_Families.emission_of name
+             = Some Gathered_Families.PerObservation ->
+          (* The loop-class gathered primitives (W-112) return ONE VAR PER
+             OBSERVATION, not a single var: the rev-mode [accumulator<var>]
+             partial specialization keeps a 128-element chunk-collapse
+             buffer, so the model must push each term into [lp_accum__]
+             separately, in n order, to keep the stock loop's accumulation
+             schedule (and therefore the lp value) bit-identical. *)
+          [ Block
+              [ VariableDefn
+                  (make_variable_defn
+                     ~type_:(Const (TypeLiteral "std::vector<stan::math::var>"))
+                     ~name:"lp_terms__"
+                     ~init:(Assignment (lower_expr e)) ())
+              ; ForEach
+                  ( (Const (Ref Auto), "lp_term__")
+                  , Var "lp_terms__"
+                  , Expression (accum.@?("add", [Var "lp_term__"])) ) ] ]
+      | _ -> accum.@?("add", [lower_expr e]) |> wrap_e)
   | JacobianPE e ->
       let accum = Var "lp_accum__" in
       [ ConstexprIf
