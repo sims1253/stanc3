@@ -1742,6 +1742,40 @@ let%expect_test "dead code elimination" =
         if(PNot__(emit_generated_quantities__)) return;
       } |}]
 
+(* DCE must not remove expressions whose evaluation is observable:
+   RNG calls advance the seeded stream (changing every later draw), and
+   calls to user-defined functions may print or reject. *)
+let%test_unit "dce keeps rng and user-defined calls with unused results" =
+  let mir =
+    reset_and_mir_of_string
+      {|
+      functions {
+        real f(real x) { print("side effect!"); return x; }
+        real f(vector x) { return 0; }
+      }
+      transformed data {
+        real td_rng = exponential_rng(1);
+      }
+      model {
+        real u = f(1);
+        real dead = 5;
+        print("done");
+      }
+      |}
+  in
+  let mir = function_inlining mir |> dead_code_elimination in
+  let out = Fmt.str "@[<v>%a@]" Program.Typed.pp mir in
+  let has sub =
+    let n = String.length sub and m = String.length out in
+    let rec go i = i + n <= m && (String.sub out i n = sub || go (i + 1)) in
+    go 0 in
+  (* the overloaded user call is not inlined and must survive: its body prints *)
+  assert (has "f(");
+  (* the rng initializer must survive: it advances the seeded stream *)
+  assert (has "exponential_rng");
+  (* dce still works: the pure dead declaration is removed *)
+  assert (not (has "= 5"))
+
 let%expect_test "dead code elimination decl" =
   let mir =
     reset_and_mir_of_string
