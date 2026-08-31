@@ -23,6 +23,18 @@ val list_collapsing : Program.Typed.t -> Program.Typed.t
 (** Remove redundant SList constructors from the Mir that might have been
     introduced by other optimizations *)
 
+val hoist_const_lgamma : Program.Typed.t -> Program.Typed.t
+(** Rewrite [target += poisson_log_lpmf(y, ...)] / [poisson_log_glm_lpmf]
+    calls whose random variable [y] is a data integer array in the
+    reverse-mode log prob: the constant term [- sum(lgamma(y + 1))] is
+    hoisted to a new transformed-data double computed once at data
+    initialization, the call is rewritten to its [propto__] overload (which
+    drops the constant), and the precomputed constant is re-added to the
+    accumulator as one term. The full-constant value of [lp__] is preserved
+    to summation-order ulps while the gradient path stops recomputing
+    lgamma of constant data. The double-mode instantiation and the
+    [~] / [_lupmf] forms (already propto) are left unchanged *)
+
 val block_fixing : Program.Typed.t -> Program.Typed.t
 (** Make sure that SList constructors directly under if, for, while or fundef
     constructors are replaced with Block constructors. This should probably be
@@ -85,7 +97,8 @@ type optimization_settings =
   ; lazy_code_motion: bool
   ; optimize_ad_levels: bool
   ; preserve_stability: bool
-  ; optimize_soa: bool }
+  ; optimize_soa: bool
+  ; hoist_const_lgamma: bool }
 
 val all_optimizations : optimization_settings
 val no_optimizations : optimization_settings
