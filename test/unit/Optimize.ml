@@ -2129,6 +2129,57 @@ let%expect_test "partially evaluate with equality check" =
         if(PNot__(emit_generated_quantities__)) return;
       } |}]
 
+(* Rejected must not escape from dead ternary arms / short-circuited
+   operands: it used to turn the whole statement into an unconditional
+   reject at O1. *)
+let%test_unit "partial evaluation keeps live ternary arm under a dead rejected arm" =
+  let mir =
+    reset_and_mir_of_string
+      {|
+      model {
+        int y = 1;
+        print(y == 1 ? 42 : 1 %/% 0);
+      }
+      |}
+  in
+  let out = Fmt.str "@[<v>%a@]" Program.Typed.pp (partial_evaluation mir) in
+  assert (String.is_substring out "FnPrint__(42)");
+  assert (not (String.is_substring out "IntDivide__"));
+  assert (not (String.is_substring out "FnReject__"))
+
+let%test_unit "partial evaluation keeps dead rejected arm when condition is unfolded" =
+  let mir =
+    reset_and_mir_of_string
+      {|
+      parameters {
+        real p;
+      }
+      model {
+        print(p > 0 ? 42 : 1 %/% 0);
+      }
+      |}
+  in
+  let out = Fmt.str "@[<v>%a@]" Program.Typed.pp (partial_evaluation mir) in
+  (* the dead arm survives unoptimized instead of rejecting the statement *)
+  assert (String.is_substring out "IntDivide__");
+  assert (not (String.is_substring out "FnReject__"))
+
+let%test_unit "partial evaluation short-circuits && under a dead rejected operand" =
+  let mir =
+    reset_and_mir_of_string
+      {|
+      model {
+        int y = 0;
+        if (y == 1 && 1 %/% 0 == 0) print("unreachable");
+      }
+      |}
+  in
+  let out = Fmt.str "@[<v>%a@]" Program.Typed.pp (partial_evaluation mir) in
+  (* left operand folds to 0: short-circuit, statement is dead, no reject *)
+  assert (not (String.is_substring out "IntDivide__"));
+  assert (not (String.is_substring out "unreachable"));
+  assert (not (String.is_substring out "FnReject__"))
+
 let%expect_test "partially evaluate functions" =
   let mir =
     reset_and_mir_of_string

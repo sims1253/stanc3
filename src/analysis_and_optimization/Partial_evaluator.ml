@@ -86,7 +86,10 @@ let is_multi_index = function
   | Index.MultiIndex _ | Upfrom _ | Between _ | All -> true
   | Single _ -> false
 
-let rec eval_expr ?(preserve_stability = false) (e : Expr.Typed.t) =
+let rec try_eval_expr ?(preserve_stability = false) expr =
+  try eval_expr ~preserve_stability expr with Rejected _ -> expr
+
+and eval_expr ?(preserve_stability = false) (e : Expr.Typed.t) =
   { e with
     pattern=
       (match e.pattern with
@@ -1019,36 +1022,53 @@ let rec eval_expr ?(preserve_stability = false) (e : Expr.Typed.t) =
                     | _ -> FunApp (kind, l))
                 | _ -> FunApp (kind, l)))
       | TernaryIf (e1, e2, e3) -> (
-          match
-            ( eval_expr ~preserve_stability e1
-            , eval_expr ~preserve_stability e2
-            , eval_expr ~preserve_stability e3 )
-          with
-          | x, _, e3' when is_int 0 x -> e3'.pattern
-          | {pattern= Lit (Int, _); _}, e2', _ -> e2'.pattern
-          | e1', e2', e3' -> TernaryIf (e1', e2', e3'))
+          (* e1 is live, so a compile-time Rejected from it propagates. An
+             arm selected by a folded condition is also live. A Rejected from
+             a dead arm must not reject the whole statement: try_eval_expr
+             keeps the original (unoptimized) sub-expression instead. *)
+          let e1' = eval_expr ~preserve_stability e1 in
+          match e1' with
+          | x when is_int 0 x -> (eval_expr ~preserve_stability e3).pattern
+          | {pattern= Lit (Int, _); _} ->
+              (eval_expr ~preserve_stability e2).pattern
+          | _ ->
+              let e2' = try_eval_expr ~preserve_stability e2 in
+              let e3' = try_eval_expr ~preserve_stability e3 in
+              TernaryIf (e1', e2', e3'))
       | EAnd (e1, e2) -> (
-          match
-            (eval_expr ~preserve_stability e1, eval_expr ~preserve_stability e2)
-          with
-          | {pattern= Lit (Int, s1); _}, {pattern= Lit (Int, s2); _} ->
-              let i1, i2 = (Int.of_string s1, Int.of_string s2) in
-              Lit (Int, Int.to_string (Bool.to_int (i1 <> 0 && i2 <> 0)))
-          | {pattern= Lit (_, s1); _}, {pattern= Lit (_, s2); _} ->
-              let r1, r2 = (Float.of_string s1, Float.of_string s2) in
-              Lit (Int, Int.to_string (Bool.to_int (r1 <> 0. && r2 <> 0.)))
-          | e1', e2' -> EAnd (e1', e2'))
+          (* e1 is live. e2 is short-circuited away when e1 folds to false;
+             a Rejected from e2 propagates only when e1 is truthy. *)
+          let e1' = eval_expr ~preserve_stability e1 in
+          let is_lit_zero (e : Expr.Typed.t) =
+            match e.pattern with
+            | Lit (Int, s) -> Int.of_string s = 0
+            | Lit (Real, s) -> Float.of_string s = 0.
+            | _ -> false in
+          if is_lit_zero e1' then Lit (Int, "0")
+          else
+            let e2' = try_eval_expr ~preserve_stability e2 in
+            match (e1', e2') with
+            | {pattern= Lit (_, s1); _}, {pattern= Lit (_, s2); _} ->
+                let r1, r2 = (Float.of_string s1, Float.of_string s2) in
+                Lit (Int, Int.to_string (Bool.to_int (r1 <> 0. && r2 <> 0.)))
+            | e1', e2' -> EAnd (e1', e2'))
       | EOr (e1, e2) -> (
-          match
-            (eval_expr ~preserve_stability e1, eval_expr ~preserve_stability e2)
-          with
-          | {pattern= Lit (Int, s1); _}, {pattern= Lit (Int, s2); _} ->
-              let i1, i2 = (Int.of_string s1, Int.of_string s2) in
-              Lit (Int, Int.to_string (Bool.to_int (i1 <> 0 || i2 <> 0)))
-          | {pattern= Lit (_, s1); _}, {pattern= Lit (_, s2); _} ->
-              let r1, r2 = (Float.of_string s1, Float.of_string s2) in
-              Lit (Int, Int.to_string (Bool.to_int (r1 <> 0. || r2 <> 0.)))
-          | e1', e2' -> EOr (e1', e2'))
+          (* e1 is live. e2 is short-circuited away when e1 folds to true;
+             a Rejected from e2 propagates only when e1 is falsy. *)
+          let e1' = eval_expr ~preserve_stability e1 in
+          let is_lit_nonzero (e : Expr.Typed.t) =
+            match e.pattern with
+            | Lit (Int, s) -> Int.of_string s <> 0
+            | Lit (Real, s) -> Float.of_string s <> 0.
+            | _ -> false in
+          if is_lit_nonzero e1' then Lit (Int, "1")
+          else
+            let e2' = try_eval_expr ~preserve_stability e2 in
+            match (e1', e2') with
+            | {pattern= Lit (_, s1); _}, {pattern= Lit (_, s2); _} ->
+                let r1, r2 = (Float.of_string s1, Float.of_string s2) in
+                Lit (Int, Int.to_string (Bool.to_int (r1 <> 0. || r2 <> 0.)))
+            | e1', e2' -> EOr (e1', e2'))
       | TupleProjection
           ({pattern= FunApp (CompilerInternal FnMakeTuple, ts); _}, ix) ->
           (List.nth ts (ix - 1)).pattern
@@ -1139,8 +1159,6 @@ let rec simplify_indices_expr expr =
       |> Expr.Pattern.map simplify_indices_expr in
     {expr with pattern})
 
-let try_eval_expr expr = try eval_expr expr with Rejected _ -> expr
-
 let rec eval_stmt s =
   try
     Stmt.
@@ -1153,4 +1171,5 @@ let rec eval_stmt s =
     { Stmt.pattern= NRFunApp (CompilerInternal FnReject, [Expr.Helpers.str m])
     ; meta= loc }
 
-let eval_prog p : Program.Typed.t = Program.map try_eval_expr eval_stmt Fun.id p
+let eval_prog p : Program.Typed.t =
+  Program.map (fun e -> try_eval_expr e) eval_stmt Fun.id p
