@@ -668,7 +668,23 @@ let cannot_duplicate_expr ?(preserve_stability = false) (e : Expr.Typed.t) =
     || (preserve_stability && UnsizedType.is_autodiffable e.meta.type_) in
   expr_any pred e
 
-let cannot_remove_expr (e : Expr.Typed.t) = expr_any can_side_effect_top_expr e
+let cannot_remove_expr (e : Expr.Typed.t) =
+  (* RNG calls are observable through the seeded draw stream, and calls to
+     user-defined functions (whose bodies may print, reject, or touch external
+     state) as well as print/reject themselves must not be removed, even if
+     their result is unused. *)
+  expr_any
+    (fun e ->
+      can_side_effect_top_expr e
+      || (match e.pattern with
+          | FunApp
+              ( ( UserDefined (_, (FnPlain | FnRng))
+                | StanLib (_, FnRng, _)
+                | CompilerInternal (FnPrint | FnReject | FnFatalError) )
+              , _ ) ->
+              true
+          | _ -> false))
+    e
 
 (* Rewrites e.g. [for (n in 1:N) target += normal_lpdf(y[n] | mu[n], sigma)] to
    [target += normal_lpdf(y | mu, sigma)]. Tilde statements have the same MIR
