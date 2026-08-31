@@ -85,7 +85,17 @@ type optimization_settings =
   ; lazy_code_motion: bool
   ; optimize_ad_levels: bool
   ; preserve_stability: bool
-  ; optimize_soa: bool }
+  ; optimize_soa: bool
+  ; emit_normal_glm: bool }
+
+val emit_normal_glm : Program.Typed.t -> Program.Typed.t
+(** Rewrite everyday linear-predictor [normal_lpdf] likelihoods (matrix
+    predictors [x * beta (+ alpha)], and scalar-intercept +
+    scalar-slope-scaled data-vector chains incl. their --O1 fma spelling) to
+    [normal_id_glm_lpdf] calls in the reverse-mode log prob. Statistical
+    transform: the glm interior computes analytically-simplified gradients
+    and differently-associated log densities (last-ulp-class differences);
+    see the pass docstring in Optimize.ml. Runs last in the suite. *)
 
 val all_optimizations : optimization_settings
 val no_optimizations : optimization_settings
